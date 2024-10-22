@@ -263,7 +263,7 @@ class LLMEngine:
             "multi_step_stream_outputs=%s, enable_prefix_caching=%s, "
             "use_async_output_proc=%s, use_cached_outputs=%s, "
             "chat_template_text_format=%s, mm_processor_kwargs=%s, "
-            "pooler_config=%r)",
+            "pooler_config=%r, split_qk_v=%s)",
             VLLM_VERSION,
             model_config.model,
             speculative_config,
@@ -302,6 +302,7 @@ class LLMEngine:
             model_config.chat_template_text_format,
             model_config.mm_processor_kwargs,
             model_config.pooler_config,
+            cache_config.split_qk_v,
         )
         # TODO(woosuk): Print more configs in debug mode.
         self.model_config = model_config
@@ -386,6 +387,8 @@ class LLMEngine:
                     model_config.enforce_eager,
                     "disable_custom_all_reduce":
                     parallel_config.disable_custom_all_reduce,
+                    "split_qk_v":
+                    cache_config.split_qk_v,
                 })
 
         if self.tokenizer:
