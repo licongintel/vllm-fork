@@ -115,6 +115,8 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
         self.matmul_av = Matmul()
         self.batch2block_matmul = Matmul()
         self.block2batch_matmul = Matmul()
+        self.batch2block_softmax = Matmul()
+        self.block2batch_softmax = Matmul()
         self.k_cache = VLLMKVCache()
         self.v_cache = VLLMKVCache()
         self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
@@ -255,6 +257,8 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                 matmul_av_op=self.matmul_av,
                 batch2block_matmul_op=self.batch2block_matmul,
                 block2batch_matmul_op=self.block2batch_matmul,
+                batch2block_softmax_op=self.batch2block_softmax,
+                block2batch_softmax_op=self.block2batch_softmax,
                 keys_fetch_func=self.k_cache.fetch_from_cache,
                 values_fetch_func=self.v_cache.fetch_from_cache)
         # Reshape the output tensor.
