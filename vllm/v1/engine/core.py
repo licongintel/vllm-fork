@@ -17,7 +17,7 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.v1.core.scheduler import Scheduler
 from vllm.v1.engine import (EngineCoreOutput, EngineCoreOutputs,
                             EngineCoreRequest, EngineCoreRequestType)
-from vllm.v1.executor.gpu_executor import GPUExecutor
+#from vllm.v1.executor.gpu_executor import GPUExecutor
 from vllm.v1.request import Request, RequestStatus
 from vllm.version import __version__ as VLLM_VERSION
 
@@ -34,7 +34,7 @@ class EngineCore:
     def __init__(
         self,
         vllm_config: VllmConfig,
-        executor_class: Type[GPUExecutor],
+        executor_class: Type[Any],
         usage_context: UsageContext,
     ):
         # Override the configs for V1.
@@ -124,7 +124,7 @@ class EngineCoreProc(EngineCore):
     def __init__(
         self,
         vllm_config: VllmConfig,
-        executor_class: Type[GPUExecutor],
+        executor_class: Type[Any],
         usage_context: UsageContext,
         input_path: str,
         output_path: str,
@@ -209,7 +209,7 @@ class EngineCoreProc(EngineCore):
     @staticmethod
     def make_engine_core_process(
         vllm_config: VllmConfig,
-        executor_class: Type[GPUExecutor],
+        executor_class: Type[Any],
         usage_context: UsageContext,
         input_path: str,
         output_path: str,
