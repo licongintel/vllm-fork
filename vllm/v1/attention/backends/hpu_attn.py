@@ -21,7 +21,7 @@ from vllm.utils import is_fake_hpu
 logger = init_logger(__name__)
 
 
-class HPUAttentionBackend(AttentionBackend):
+class HPUAttentionBackendV1(AttentionBackend):
 
     @staticmethod
     def get_name() -> str:

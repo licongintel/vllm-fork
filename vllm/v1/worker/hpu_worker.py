@@ -70,7 +70,7 @@ class HPUWorker:
             init_cached_hf_modules()
 
         self.model_runner: HPUModelRunner = HPUModelRunner(
-            vllm_config=vllm_config, is_driver_worker=is_driver_worker)
+            vllm_config=vllm_config)
         # Uninitialized cache engine. Will be initialized by
         # initialize_cache.
         self.cache_engine: List[HPUCacheEngine]
@@ -192,9 +192,6 @@ class HPUWorker:
         num_hpu_blocks = max(num_hpu_blocks, 0)
         num_cpu_blocks = max(num_cpu_blocks, 0)
 
-        if self.model_runner.lora_manager:
-            self.model_runner.remove_all_loras()
-
         gc.collect()
         return num_hpu_blocks, num_cpu_blocks
 
@@ -235,7 +232,8 @@ class HPUWorker:
         # NOTE(kzawora): We should use virtual engine index here
         # for pipeline parallelism. Using 0 for now.
         assert self.hpu_cache is not None
-        self.model_runner.warmup_model(self.hpu_cache[0])
+        logger.error("Warmup is disabled for v1 HPU worker")
+        #self.model_runner.warmup_model(self.hpu_cache[0])
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
