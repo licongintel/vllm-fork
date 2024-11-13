@@ -24,7 +24,7 @@ class KVCacheManager:
         self.block_size = block_size
         self.num_gpu_blocks = num_gpu_blocks
         self.sliding_window = sliding_window
-        self.enable_caching = enable_caching
+        self.enable_caching = False
         # NOTE(woosuk): To avoid frequent block allocation, we preallocate some
         # blocks for each request. For example, when a request reaches the end
         # of its block table, we preallocate N blocks in advance. This way, we

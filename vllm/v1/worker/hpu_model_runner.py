@@ -22,7 +22,7 @@ from vllm.multimodal import MultiModalDataDict
 from vllm.plugins import set_compilation_config
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, cdiv, is_fake_hpu,
-                        is_pin_memory_available)
+                        is_pin_memory_available, make_tensor_with_pad)
 from vllm.v1.attention.backends.hpu_attn import HPUAttentionBackendV1, HPUAttentionMetadata
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -134,9 +134,11 @@ class HpuModelAdapter:
 
     def forward(self, *args, **kwargs):
         kwargs = kwargs.copy()
-        selected_token_indices = kwargs.pop('selected_token_indices')
-        if 'warmup_mode' in kwargs:
-            kwargs.pop('warmup_mode')
+        if 'selected_token_indices' in kwargs:
+            kwargs.pop('selected_token_indices')
+#        selected_token_indices = kwargs.pop('selected_token_indices')
+#        if 'warmup_mode' in kwargs:
+#            kwargs.pop('warmup_mode')
         input_ids = kwargs['input_ids']
         kwargs['attn_metadata'] = self._update_metadata(
             kwargs['attn_metadata'], input_ids.size(0), input_ids.size(1),
@@ -144,7 +146,7 @@ class HpuModelAdapter:
         #LoraMask.setLoraMask(kwargs.pop('lora_mask'))
         hidden_states = self.model(*args, **kwargs)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        hidden_states = hidden_states.index_select(0, selected_token_indices)
+#        hidden_states = hidden_states.index_select(0, selected_token_indices)
         return hidden_states
 
     def compute_logits(self, *args, **kwargs):
@@ -162,7 +164,7 @@ class HpuModelAdapter:
 def _maybe_wrap_in_hpu_graph(*args, **kwargs):
     return htorch.hpu.wrap_in_hpu_graph(
         HpuModelAdapter(*args, **kwargs), disable_tensor_cache=True
-    ) if htorch.utils.internal.is_lazy() else HpuModelAdapter(*args, **kwargs)
+    ) if False and htorch.utils.internal.is_lazy() else HpuModelAdapter(*args, **kwargs)
 
 def subtuple(obj: object,
              typename: str,
@@ -429,10 +431,16 @@ class HPUModelRunner:
         num_scheduled_tokens = np.array(num_scheduled_tokens, dtype=np.int32)
         assert max_num_scheduled_tokens > 0
 
+        # NOTE(kzawora): In prefills, when prefix caching is enabled (on by 
+        # default), num_computed_tokens_cpu might be non-zero even for first 
+        # batch. This is a new behavior in V1 - KVs can be cached even within 
+        # the same iteration
         seq_lens = (self.input_batch.num_computed_tokens_cpu[:num_reqs] +
                     num_scheduled_tokens)
-        context_lens = self.input_batch.num_output_tokens_cpu[:num_reqs] + self.input_batch.num_prompt_tokens_cpu[:num_reqs]
+        context_lens = self.input_batch.num_computed_tokens_cpu[:num_reqs]
         max_seq_len = seq_lens.max()
+        num_blocks = math.ceil(max_seq_len / self.block_size) # NOTE(kzawora): it seems like block table is overallocated by 1, but I don't know why. Maybe add +1 here
+        max_blocked_seq_len = num_blocks * self.block_size
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
@@ -441,11 +449,13 @@ class HPUModelRunner:
 
         # Get batched arange.
         # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-        arange_matrix = np.tile(np.arange(max_num_scheduled_tokens),
+        arange_matrix = np.tile(np.arange(max_blocked_seq_len),
                                 (num_reqs, 1))
         mask = arange_matrix < num_scheduled_tokens[:, np.newaxis]
         arange = arange_matrix[mask]
-
+        arange_matrix[~mask] = 0
+        
+        
         # Get positions.
         positions = torch.empty((total_num_scheduled_tokens, ),
                                 dtype=torch.int32,
@@ -473,16 +483,23 @@ class HPUModelRunner:
                            out=input_ids)
 
         # Calculate the slot mapping.
-        block_numbers = self.input_batch.block_table_cpu_tensor.flatten()[
-            token_indices // self.block_size]
+        #block_numbers = self.input_batch.block_table_cpu_tensor.flatten()[
+        #    token_indices // self.block_size]
+        block_numbers = self.input_batch.block_table_cpu_tensor
         block_offsets = token_indices % self.block_size
-        slot_mapping = torch.empty((total_num_scheduled_tokens, ),
-                                   dtype=torch.int32,
-                                   device="cpu",
-                                   pin_memory=self.pin_memory)
-        torch.add(block_numbers * self.block_size,
-                  block_offsets,
-                  out=slot_mapping)
+        
+        block_table = self.input_batch.block_table_cpu_tensor[:num_reqs,:num_blocks]
+        import pdb; pdb.set_trace()
+        
+        slot_mapping = torch.add(torch.repeat_interleave(torch.mul(block_table, self.block_size), self.block_size, dim=1), torch.from_numpy(arange_matrix))
+        slot_mapping.masked_fill_(torch.from_numpy(~mask), 0)
+        #slot_mapping = torch.empty((num_reqs,max_seq_len),
+        #                           dtype=torch.int32,
+        #                           device="cpu",
+        #                           pin_memory=self.pin_memory)
+#        torch.add(block_numbers * self.block_size,
+#                  block_offsets,
+#                  out=slot_mapping)
 
         # Prepare the attention metadata.
         query_start_loc = torch.empty((num_reqs + 1, ),
@@ -502,13 +519,17 @@ class HPUModelRunner:
         seq_start_loc_np[0] = 0
         np.cumsum(seq_lens, out=seq_start_loc_np[1:])
 
-        import pdb; pdb.set_trace()
         # NOTE(kzawora): this is probably dumb
-        input_ids = self.input_batch.token_ids_cpu[:num_reqs,:max_seq_len]
+        input_ids = self.input_batch.token_ids_cpu[:num_reqs,:max_blocked_seq_len]
         positions = [list(range(context_len, seq_len)) for context_len, seq_len in zip(context_lens,seq_lens)] # idk what to do here
         self.input_ids[:num_reqs,:max_seq_len].copy_(torch.from_numpy(input_ids),
                                                      non_blocking=True)
-        self.positions[:num_reqs,:max_seq_len].copy_(torch.from_numpy(positions),
+        positions = make_tensor_with_pad(positions,
+                                        max_len=max_blocked_seq_len,
+                                        pad=0,
+                                        dtype=torch.long,
+                                        device=self.device)
+        self.positions[:num_reqs,:max_seq_len].copy_(positions,
                                                      non_blocking=True)
         seq_lens_tensor = torch.empty((num_reqs, ),
                                 dtype=torch.int32,
@@ -525,14 +546,13 @@ class HPUModelRunner:
         query_start_loc = query_start_loc.to(self.device, non_blocking=True)
         seq_start_loc = seq_start_loc.to(self.device, non_blocking=True)
         slot_mapping = slot_mapping.to(self.device, non_blocking=True).long()
-        seq_lens = self.seq_lens.to(self.device, non_blocking=True)
-
-        import pdb; pdb.set_trace()
-        attn_metadata = None
+        seq_lens_tensor = seq_lens_tensor.to(self.device, non_blocking=True)
+        context_lens_tensor = context_lens_tensor.to(self.device, non_blocking=True)
 
         prefix_block_list_tensor = [] # FIXME(kzawora)
         block_indices, block_offsets = precompute_indices_and_offsets(
-            self.block_size, slot_mapping, True)
+            self.block_size, slot_mapping, is_prompt)
+        import pdb; pdb.set_trace()
         attn_metadata = HPUAttentionMetadata(
             is_prompt=is_prompt,
             block_list=prefix_block_list_tensor,
@@ -590,22 +610,22 @@ class HPUModelRunner:
         self._update_states(scheduler_output)
         attn_metadata, logits_indices = self._prepare_inputs(scheduler_output)
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        if (self.use_cuda_graph
-                and num_scheduled_tokens <= self.cudagraph_batch_sizes[-1]):
-            # Use piecewise CUDA graphs.
-            # Add padding to the batch size.
-            num_input_tokens = self._get_padded_batch_size(
-                num_scheduled_tokens)
-        else:
-            # Eager mode.
-            num_input_tokens = num_scheduled_tokens
+        batch_size = self.input_batch.num_reqs
+        seq_lens = (self.input_batch.num_computed_tokens_cpu[:batch_size] +
+                    num_scheduled_tokens)
+        max_seq_len = seq_lens.max()
+        num_blocks = math.ceil(max_seq_len / self.block_size) # NOTE(kzawora): it seems like block table is overallocated by 1, but I don't know why. Maybe add +1 here
+        max_blocked_seq_len = num_blocks * self.block_size
 
+        seq_len = num_scheduled_tokens
+        trimmed_attn_metadata = trim_attn_metadata(attn_metadata)
         with set_forward_context(attn_metadata):
-            hidden_states = self.model(
-                input_ids=self.input_ids[:num_input_tokens],
-                positions=self.positions[:num_input_tokens],
+            import pdb; pdb.set_trace()
+            hidden_states = self.model.forward(
+                input_ids=self.input_ids[:batch_size,:max_blocked_seq_len],
+                positions=self.positions[:batch_size,:max_blocked_seq_len],
                 kv_caches=self.kv_caches,
-                attn_metadata=None,
+                attn_metadata=trimmed_attn_metadata,
             )
         hidden_states = hidden_states[:num_scheduled_tokens]
         hidden_states = hidden_states[logits_indices]
@@ -739,6 +759,7 @@ class HPUModelRunner:
         )
         selected_token_indices = torch.arange(0, seq_len*batch_size, device=self.device)
         trimmed_attn_metadata = trim_attn_metadata(attn_metadata)
+        return # bypass dummy run for now
         # Dummy run.
         self.model.forward(input_ids=input_ids,
                             positions=position_ids,
@@ -813,13 +834,14 @@ class HPUModelRunner:
         if self.device != 'hpu' and not is_fake_hpu() \
           and self.dtype == torch.float8_e4m3fn:
             dtype = torch.uint8
-        for _ in range(self.num_attention_layers):
+        for _ in range(self.num_attn_layers):
             key_cache = torch.zeros(kv_cache_shape, dtype=dtype, device=self.device)
             value_cache = torch.zeros(kv_cache_shape,
                                       dtype=dtype,
                                       device=self.device)
             kv_layer = (key_cache, value_cache)
             self.kv_caches.append(kv_layer)
+        htorch.hpu.synchronize()
 
     def _get_padded_batch_size(self, batch_size: int) -> Optional[int]:
         # TODO: Optimize this?
@@ -870,7 +892,7 @@ class InputBatch:
 
         self.token_ids_cpu = np.empty((max_num_reqs, max_model_len),
                                       dtype=np.int32)
-        self.num_computed_tokens_cpu = np.empty(max_num_reqs, dtype=np.int32)
+        self.num_computed_tokens_cpu = np.zeros(max_num_reqs, dtype=np.int32)
         self.num_output_tokens_cpu = np.empty(max_num_reqs, dtype=np.int32)
         self.num_prompt_tokens_cpu = np.empty(max_num_reqs, dtype=np.int32)
 

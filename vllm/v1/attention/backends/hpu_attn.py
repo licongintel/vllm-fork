@@ -174,6 +174,7 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
         block_indices = attn_metadata.block_indices
         block_offsets = attn_metadata.block_offsets
         if attn_metadata.is_prompt:
+            import pdb; pdb.set_trace()
             key = key.unflatten(0, (block_indices.size(0), -1))
             value = value.unflatten(0, (block_indices.size(0), -1))
         if kv_cache is not None:

@@ -25,7 +25,7 @@ class HPUExecutor:
         self.observability_config = vllm_config.observability_config
 
         self.worker = self._create_worker()
-        self.worker.init_device()
+        self.worker.initialize()
         self.worker.load_model()
 
     def _create_worker(
@@ -62,7 +62,7 @@ class HPUExecutor:
         logger.info("# HPU blocks: %d", num_hpu_blocks)
         from vllm_hpu_extension.profiler import HabanaMemoryProfiler
         with HabanaMemoryProfiler() as cache_init_m:
-            self.worker.initialize_cache(num_hpu_blocks, 0)
+            self.worker.initialize_cache(num_hpu_blocks)
         msg = f"init_cache_engine took {cache_init_m.get_summary_string()}"
         logger.info(msg)
 
