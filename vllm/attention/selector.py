@@ -173,12 +173,12 @@ def _cached_get_attn_backend(
         return FlashInferBackend
     elif backend == _Backend.HPU_ATTN:
         logger.info("Using HPUAttention backend.")
-        from vllm.v1.attention.backends.hpu_attn import HPUAttentionBackendV1
-        return HPUAttentionBackendV1
-    elif backend == _Backend.HPU_ATTN_V1:
-        logger.info("Using HPUAttentionV1 backend.")
         from vllm.attention.backends.hpu_attn import HPUAttentionBackend
         return HPUAttentionBackend
+    elif backend == _Backend.HPU_ATTN_V1:
+        logger.info("Using HPUAttentionV1 backend.")
+        from vllm.v1.attention.backends.hpu_attn import HPUAttentionBackendV1
+        return HPUAttentionBackendV1
     elif backend == _Backend.PALLAS:
         logger.info("Using Pallas backend.")
         from vllm.attention.backends.pallas import PallasAttentionBackend
