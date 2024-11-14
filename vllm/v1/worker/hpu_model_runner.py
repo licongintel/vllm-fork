@@ -485,22 +485,10 @@ class HPUModelRunner:
                            out=input_ids)
 
         # Calculate the slot mapping.
-        #block_numbers = self.input_batch.block_table_cpu_tensor.flatten()[
-        #    token_indices // self.block_size]
-        block_numbers = self.input_batch.block_table_cpu_tensor
-        block_offsets = token_indices % self.block_size
-        
         block_table = self.input_batch.block_table_cpu_tensor[:num_reqs,:num_blocks]
         
         slot_mapping = torch.add(torch.repeat_interleave(torch.mul(block_table, self.block_size), self.block_size, dim=1), torch.from_numpy(arange_matrix))
         slot_mapping.masked_fill_(torch.from_numpy(~mask), 0)
-        #slot_mapping = torch.empty((num_reqs,max_seq_len),
-        #                           dtype=torch.int32,
-        #                           device="cpu",
-        #                           pin_memory=self.pin_memory)
-#        torch.add(block_numbers * self.block_size,
-#                  block_offsets,
-#                  out=slot_mapping)
 
         # Prepare the attention metadata.
         query_start_loc = torch.empty((num_reqs + 1, ),
@@ -599,7 +587,7 @@ class HPUModelRunner:
         block_scales: Union[List[Union[None, float]], torch.Tensor]
         block_list: Union[List[int], torch.Tensor]
 
-        if False #self.use_contiguous_pa:
+        if False: #self.use_contiguous_pa:
             block_list = list(itertools.chain(*block_tables))
             max_idx = max(block_list)
             max_blocks = max(max_idx + 1, len(block_list))
