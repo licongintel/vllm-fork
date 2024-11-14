@@ -538,8 +538,10 @@ class HPUModelRunner:
         seq_lens_tensor = seq_lens_tensor.to(self.device, non_blocking=True)
         context_lens_tensor = context_lens_tensor.to(self.device, non_blocking=True)
         block_list, block_mapping, block_groups, block_usage, block_indices, block_offsets, block_scales = None, None, None, None, None, None, None
-        if is_prompt:
+        block_indices, block_offsets = precompute_indices_and_offsets(self.block_size, slot_mapping, is_prompt)
+        if not is_prompt:
             block_list, block_mapping, block_groups, block_usage, block_indices, block_offsets, block_scales = self.get_habana_paged_attn_buffers(block_table, slot_mapping)
+
         attn_metadata = HPUAttentionMetadata(
             is_prompt=is_prompt,
             block_list=block_list,
@@ -620,7 +622,8 @@ class HPUModelRunner:
             block_usage = [u if u is not None else 1 for u in block_usage]
 
         else:
-            blocks_used = [len(bt) for bt in block_tables if bt]
+            import pdb; pdb.set_trace()
+            blocks_used = [len(bt) for bt in block_tables if bt is not None]
             block_list = []
             block_scales = []
             for bt in block_tables:
