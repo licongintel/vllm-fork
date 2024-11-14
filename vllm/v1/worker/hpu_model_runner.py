@@ -136,19 +136,12 @@ class HpuModelAdapter:
 
     def forward(self, *args, **kwargs):
         kwargs = kwargs.copy()
-        if 'selected_token_indices' in kwargs:
-            kwargs.pop('selected_token_indices')
-#        selected_token_indices = kwargs.pop('selected_token_indices')
-#        if 'warmup_mode' in kwargs:
-#            kwargs.pop('warmup_mode')
         input_ids = kwargs['input_ids']
         kwargs['attn_metadata'] = self._update_metadata(
             kwargs['attn_metadata'], input_ids.size(0), input_ids.size(1),
             input_ids.device, self.dtype)
-        #LoraMask.setLoraMask(kwargs.pop('lora_mask'))
         hidden_states = self.model(*args, **kwargs)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-#        hidden_states = hidden_states.index_select(0, selected_token_indices)
         return hidden_states
 
     def compute_logits(self, *args, **kwargs):
@@ -444,9 +437,6 @@ class HPUModelRunner:
         num_blocks = math.ceil(max_seq_len / self.block_size) # NOTE(kzawora): it seems like block table is overallocated by 1, but I don't know why. Maybe add +1 here
         max_blocked_seq_len = num_blocks * self.block_size
 
-        # Get request indices.
-        # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
-        indices = np.arange(num_reqs)
 
         # Get batched arange.
         # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
@@ -466,8 +456,17 @@ class HPUModelRunner:
         # NOTE(kzawora): this is probably dumb
         input_ids = self.input_batch.token_ids_cpu[:num_reqs,:max_blocked_seq_len]
         positions = [list(range(context_len, seq_len)) for context_len, seq_len in zip(context_lens,seq_lens)] # idk what to do here
-        self.input_ids[:num_reqs,:max_blocked_seq_len].copy_(torch.from_numpy(input_ids),
-                                                     non_blocking=True)
+        self.input_ids[:num_reqs,:max_blocked_seq_len].copy_(torch.from_numpy(input_ids),     
+                              non_blocking=True)
+
+        query_start_loc = torch.empty((num_reqs + 1, ),
+                                      dtype=torch.int32,
+                                      device="cpu",
+                                      pin_memory=self.pin_memory)
+        query_start_loc_np = query_start_loc.numpy()
+        query_start_loc_np[0] = 0
+        np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1:])
+        
         positions = make_tensor_with_pad(positions,
                                         max_len=max_blocked_seq_len,
                                         pad=0,
@@ -488,7 +487,6 @@ class HPUModelRunner:
         context_lens_tensor[:num_reqs].copy_(torch.from_numpy(context_lens),
                                                           non_blocking=True)
         query_start_loc = query_start_loc.to(self.device, non_blocking=True)
-        seq_start_loc = seq_start_loc.to(self.device, non_blocking=True)
         slot_mapping = slot_mapping.to(self.device, non_blocking=True).long()
         seq_lens_tensor = seq_lens_tensor.to(self.device, non_blocking=True)
         context_lens_tensor = context_lens_tensor.to(self.device, non_blocking=True)
@@ -664,7 +662,7 @@ class HPUModelRunner:
                 attn_metadata=trimmed_attn_metadata,
             )
         hidden_states = hidden_states[:num_scheduled_tokens]
-        hidden_states = hidden_states[logits_indices]
+        hidden_states = hidden_states.index_select(0, logits_indices)
         logits = self.model.compute_logits(hidden_states, None)
 
         # Sample the next token and get logprobs if needed.
@@ -692,7 +690,7 @@ class HPUModelRunner:
                 self.input_batch.token_ids_cpu[i, seq_len] = token_id
                 req_state.output_token_ids.append(token_id)
                 req_state.num_output_tokens += 1
-                self.input_batch.num_output_tokens_cpu += 1
+                self.input_batch.num_output_tokens_cpu[i] += 1
             else:
                 # Ignore the sampled token from the partial request.
                 # Rewind the generator state as if the token was not sampled.
@@ -716,6 +714,7 @@ class HPUModelRunner:
             logprob_token_ids_cpu=logprob_token_ids,
             logprobs_cpu=logprobs,
         )
+        import pdb; pdb.set_trace()
         return model_runner_output
 
     def load_model(self) -> None:
