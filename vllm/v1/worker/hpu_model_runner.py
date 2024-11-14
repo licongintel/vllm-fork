@@ -447,66 +447,21 @@ class HPUModelRunner:
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
         indices = np.arange(num_reqs)
-        req_indices = np.repeat(indices, num_scheduled_tokens)
 
         # Get batched arange.
         # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         arange_matrix = np.tile(np.arange(max_blocked_seq_len),
                                 (num_reqs, 1))
         mask = arange_matrix < num_scheduled_tokens[:, np.newaxis]
-        arange = arange_matrix[mask]
         arange_matrix[~mask] = 0
         
-        
-        # Get positions.
-        positions = torch.empty((total_num_scheduled_tokens, ),
-                                dtype=torch.int32,
-                                device="cpu",
-                                pin_memory=self.pin_memory)
-        positions_np = positions.numpy()
-        np.add(self.input_batch.num_computed_tokens_cpu[req_indices],
-               arange,
-               out=positions_np)
-
-        # Get token indices.
-        # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-        # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
-        # where M is the max_model_len.
-        token_indices = positions_np + req_indices * self.max_model_len
-        token_indices = torch.from_numpy(token_indices)
-        input_ids = torch.empty((total_num_scheduled_tokens, ),
-                                dtype=torch.int32,
-                                device="cpu",
-                                pin_memory=self.pin_memory)
-        torch.index_select(torch.from_numpy(
-            self.input_batch.token_ids_cpu).flatten(),
-                           0,
-                           token_indices,
-                           out=input_ids)
 
         # Calculate the slot mapping.
         block_table = self.input_batch.block_table_cpu_tensor[:num_reqs,:num_blocks]
-        
+        block_table_list = block_table.tolist()
         slot_mapping = torch.add(torch.repeat_interleave(torch.mul(block_table, self.block_size), self.block_size, dim=1), torch.from_numpy(arange_matrix))
         slot_mapping.masked_fill_(torch.from_numpy(~mask), 0)
-
-        # Prepare the attention metadata.
-        query_start_loc = torch.empty((num_reqs + 1, ),
-                                      dtype=torch.int32,
-                                      device="cpu",
-                                      pin_memory=self.pin_memory)
-        query_start_loc_np = query_start_loc.numpy()
-        query_start_loc_np[0] = 0
-        np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1:])
-
-
-        seq_start_loc = torch.empty((num_reqs + 1, ),
-                                    dtype=torch.int32,
-                                    device="cpu",
-                                    pin_memory=self.pin_memory)
-        seq_start_loc_np = seq_start_loc.numpy()
-        seq_start_loc_np[0] = 0
-        np.cumsum(seq_lens, out=seq_start_loc_np[1:])
+        slot_mapping_list = slot_mapping.tolist()
 
         # NOTE(kzawora): this is probably dumb
         input_ids = self.input_batch.token_ids_cpu[:num_reqs,:max_blocked_seq_len]
@@ -537,11 +492,11 @@ class HPUModelRunner:
         slot_mapping = slot_mapping.to(self.device, non_blocking=True).long()
         seq_lens_tensor = seq_lens_tensor.to(self.device, non_blocking=True)
         context_lens_tensor = context_lens_tensor.to(self.device, non_blocking=True)
-        block_list, block_mapping, block_groups, block_usage, block_indices, block_offsets, block_scales = None, None, None, None, None, None, None
+        block_list, block_mapping, block_groups, block_usage, block_scales = None, None, None, None, None
         block_indices, block_offsets = precompute_indices_and_offsets(self.block_size, slot_mapping, is_prompt)
         if not is_prompt:
-            block_list, block_mapping, block_groups, block_usage, block_indices, block_offsets, block_scales = self.get_habana_paged_attn_buffers(block_table, slot_mapping)
-
+            block_list, block_mapping, block_groups, block_usage, block_scales = self.get_habana_paged_attn_buffers(block_table_list, slot_mapping_list)
+            import pdb; pdb.set_trace()
         attn_metadata = HPUAttentionMetadata(
             is_prompt=is_prompt,
             block_list=block_list,
@@ -651,38 +606,48 @@ class HPUModelRunner:
             block_mapping = pad_list(block_mapping, block_bucket_size, -1)
             block_usage = pad_list(block_usage, block_bucket_size, 1)
             block_scales = pad_list(block_scales, block_bucket_size, 0.0)
+
         block_list = pad_list(block_list, block_bucket_size, _PAD_BLOCK_ID)
         block_groups = pad_list(block_mapping, block_bucket_size,
                                 len(block_tables))
-        block_list = torch.tensor(block_list,
+        import pdb; pdb.set_trace() 
+        block_list_tensor = torch.empty(len(block_list),
                                 dtype=torch.int,
                                 device=self.device)
-        block_mapping = torch.tensor(block_mapping,
+        block_list_tensor.copy_(torch.tensor(block_list),
+                                non_blocking=True)
+        
+        block_mapping_tensor = torch.empty(len(block_mapping),
                                     dtype=torch.long,
                                     device=self.device)
-        block_groups = torch.tensor(block_groups,
+        block_mapping_tensor.copy_(torch.tensor(block_mapping), 
+                                   non_blocking=True)
+        
+        block_groups_tensor = torch.empty(len(block_groups),
                                     dtype=torch.long,
                                     device=self.device)
-        block_usage = torch.tensor(block_usage,
+        block_groups_tensor.copy_(torch.tensor(block_groups), 
+                                   non_blocking=True)
+
+        block_usage_tensor = torch.empty(len(block_usage),
                                 dtype=self.model_config.dtype,
                                 device=self.device)
-        slot_mapping = torch.tensor(slot_mapping,
-                                    dtype=torch.long,
-                                    device=self.device)
-
-        block_indices, block_offsets = precompute_indices_and_offsets(
-            self.block_size, slot_mapping, False)
-        block_scales = torch.tensor(block_scales,
+        block_usage_tensor.copy_(torch.tensor(block_usage),  # <- why do I see a device deadlock here??? 
+                                 non_blocking=True)
+        
+        block_scales_tensor = torch.empty(len(block_scales),
                                     dtype=self.model_config.dtype,
                                     device=self.device)
+        block_scales_tensor.copy_(torch.tensor(block_scales), non_blocking=True)
 
-        return block_list, block_mapping, block_groups, block_usage, block_indices, block_offsets, block_scales
+        return block_list_tensor, block_mapping_tensor, block_groups_tensor, block_usage_tensor, block_scales_tensor
 
     @torch.inference_mode()
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput:
+        import pdb; pdb.set_trace()
         self._update_states(scheduler_output)
         attn_metadata, logits_indices = self._prepare_inputs(scheduler_output)
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
