@@ -598,6 +598,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             self.block_size,
             self.model_config.is_attention_free,
         )
+        import pdb; pdb.set_trace()
         assert self.attn_backend == HPUAttentionBackend
 
         # Lazy initialization

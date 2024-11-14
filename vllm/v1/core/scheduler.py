@@ -25,6 +25,7 @@ class Scheduler:
         self.scheduler_config = scheduler_config
         self.cache_config = cache_config
         self.lora_config = lora_config
+        self.disable_prefill_chunking = True
         # TODO: Support LoRA.
         assert lora_config is None, "V1 does not support LoRA yet."
 
@@ -65,6 +66,7 @@ class Scheduler:
         scheduled_new_reqs: List[Request] = []
         scheduled_resumed_reqs: List[Request] = []
         scheduled_running_reqs: List[Request] = []
+        skipped_reqs: List[Request] = []
         preempted_reqs: List[Request] = []
 
         # NOTE(woosuk) on the scheduling algorithm:
@@ -90,7 +92,7 @@ class Scheduler:
             num_new_tokens = request.num_tokens - request.num_computed_tokens
             num_new_tokens = min(num_new_tokens, token_budget)
             assert num_new_tokens > 0
-
+            
             while True:
                 new_blocks = self.kv_cache_manager.append_slots(
                     request, num_new_tokens)
@@ -155,8 +157,20 @@ class Scheduler:
                     # The request cannot be scheduled.
                     break
                 request.num_computed_tokens = num_computed_tokens
-
+                
                 self.waiting.popleft()
+                if self.disable_prefill_chunking:
+                    # Prevent prefill chunking in WAITING queue
+                    running_all_decode = all(req.num_output_tokens > 0 for req in self.running) 
+                    request_is_decode = request.num_output_tokens > 0
+                    is_queue_decode = running_all_decode and request_is_decode
+                    running_all_prefill = all(req.num_output_tokens == 0 for req in self.running)
+                    request_is_prefill = request.num_output_tokens == 0
+                    is_queue_prefill = running_all_prefill and request_is_prefill
+                    if not is_queue_prefill and not is_queue_decode:
+                        skipped_reqs.append(request)
+                        break
+
                 self.running.append(request)
                 if request.status == RequestStatus.WAITING:
                     scheduled_new_reqs.append(request)
@@ -359,6 +373,7 @@ class NewRequestData:
     sampling_params: SamplingParams
     block_ids: List[int]
     num_computed_tokens: int
+    num_output_tokens : int = 0
 
     @classmethod
     def from_request(
@@ -375,6 +390,7 @@ class NewRequestData:
             sampling_params=request.sampling_params,
             block_ids=block_ids,
             num_computed_tokens=num_computed_tokens,
+            num_output_tokens=request.num_output_tokens
         )
 
 
@@ -384,6 +400,7 @@ class ResumedRequestData:
     req_id: str
     block_ids: List[int]
     num_computed_tokens: int
+    num_output_tokens: int
 
     @classmethod
     def from_request(
@@ -396,6 +413,7 @@ class ResumedRequestData:
             req_id=request.request_id,
             block_ids=block_ids,
             num_computed_tokens=num_computed_tokens,
+            num_output_tokens=request.num_output_tokens
         )
 
 
@@ -405,6 +423,7 @@ class RunningRequestData:
     req_id: str
     new_block_ids: List[int]
     num_computed_tokens: int
+    num_output_tokens: int
 
     @classmethod
     def from_request(
@@ -417,6 +436,7 @@ class RunningRequestData:
             req_id=request.request_id,
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
+            num_output_tokens=request.num_output_tokens
         )
 
 

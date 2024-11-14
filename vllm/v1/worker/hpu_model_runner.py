@@ -1,9 +1,10 @@
 import collections
+import itertools
 import math
 import os
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -99,6 +100,7 @@ class HpuModelAdapter:
                             self.block_size,
                             device=device,
                             dtype=torch.int32).unsqueeze(0)
+        import pdb; pdb.set_trace()
         mask = mask >= metadata.block_usage.unsqueeze(-1)
         attn_bias = (torch.zeros_like(mask, dtype=dtype).masked_fill_(
             mask, -math.inf))
@@ -489,7 +491,6 @@ class HPUModelRunner:
         block_offsets = token_indices % self.block_size
         
         block_table = self.input_batch.block_table_cpu_tensor[:num_reqs,:num_blocks]
-        import pdb; pdb.set_trace()
         
         slot_mapping = torch.add(torch.repeat_interleave(torch.mul(block_table, self.block_size), self.block_size, dim=1), torch.from_numpy(arange_matrix))
         slot_mapping.masked_fill_(torch.from_numpy(~mask), 0)
@@ -522,14 +523,14 @@ class HPUModelRunner:
         # NOTE(kzawora): this is probably dumb
         input_ids = self.input_batch.token_ids_cpu[:num_reqs,:max_blocked_seq_len]
         positions = [list(range(context_len, seq_len)) for context_len, seq_len in zip(context_lens,seq_lens)] # idk what to do here
-        self.input_ids[:num_reqs,:max_seq_len].copy_(torch.from_numpy(input_ids),
+        self.input_ids[:num_reqs,:max_blocked_seq_len].copy_(torch.from_numpy(input_ids),
                                                      non_blocking=True)
         positions = make_tensor_with_pad(positions,
                                         max_len=max_blocked_seq_len,
                                         pad=0,
                                         dtype=torch.long,
                                         device=self.device)
-        self.positions[:num_reqs,:max_seq_len].copy_(positions,
+        self.positions[:num_reqs,:max_blocked_seq_len].copy_(positions,
                                                      non_blocking=True)
         seq_lens_tensor = torch.empty((num_reqs, ),
                                 dtype=torch.int32,
@@ -548,20 +549,18 @@ class HPUModelRunner:
         slot_mapping = slot_mapping.to(self.device, non_blocking=True).long()
         seq_lens_tensor = seq_lens_tensor.to(self.device, non_blocking=True)
         context_lens_tensor = context_lens_tensor.to(self.device, non_blocking=True)
-
-        prefix_block_list_tensor = [] # FIXME(kzawora)
-        block_indices, block_offsets = precompute_indices_and_offsets(
-            self.block_size, slot_mapping, is_prompt)
-        import pdb; pdb.set_trace()
+        block_list, block_mapping, block_groups, block_usage, block_indices, block_offsets, block_scales = None, None, None, None, None, None, None
+        if is_prompt:
+            block_list, block_mapping, block_groups, block_usage, block_indices, block_offsets, block_scales = self.get_habana_paged_attn_buffers(block_table, slot_mapping)
         attn_metadata = HPUAttentionMetadata(
             is_prompt=is_prompt,
-            block_list=prefix_block_list_tensor,
-            block_mapping=None,
-            block_usage=None,
+            block_list=block_list,
+            block_mapping=block_mapping,
+            block_usage=block_usage,
             block_indices=block_indices,
             block_offsets=block_offsets,
-            block_scales=None,
-            block_groups=None,
+            block_scales=block_scales,
+            block_groups=block_groups,
             attn_bias=None,
             seq_lens_tensor=seq_lens_tensor, # FIXME(kzawora)
             context_lens_tensor=context_lens_tensor, # FIXME(kzawora)
@@ -571,14 +570,6 @@ class HPUModelRunner:
             slot_mapping=slot_mapping,
             multi_modal_placeholder_index_maps=None  # FIXME(kzawora): mutli-modality will not work here
         )
-        #HPUAttentionMetadata(
-        #    max_query_len=max_num_scheduled_tokens,
-        #    query_start_loc=query_start_loc,
-        #    max_seq_len=max_seq_len,
-        #    seq_start_loc=seq_start_loc,
-        #    block_table=self.input_batch.block_table[:num_reqs],
-        #    slot_mapping=slot_mapping,
-        #)
         # NOTE(woosuk): Due to chunked prefills, there can be at most 1 partial
         # request in the batch. While we should not sample any token from this
         # partial request, we do so for simplicity. We will ignore the sampled
@@ -601,6 +592,100 @@ class HPUModelRunner:
         # Create the sampling metadata.
         sampling_metadata = self.input_batch.make_sampling_metadata(skip_copy)
         return sampling_metadata
+    
+    def get_habana_paged_attn_buffers(self, block_tables, slot_mapping):
+        block_mapping: Union[List[Union[None, int]], torch.Tensor]
+        block_usage: Union[List[Union[None, int]], torch.Tensor]
+        block_scales: Union[List[Union[None, float]], torch.Tensor]
+        block_list: Union[List[int], torch.Tensor]
+
+        if False #self.use_contiguous_pa:
+            block_list = list(itertools.chain(*block_tables))
+            max_idx = max(block_list)
+            max_blocks = max(max_idx + 1, len(block_list))
+            block_bucket_size = find_bucket(
+                max_blocks,
+                self.bucketing_global_state.decode_block_bucket_cfg)
+            block_bucket_size = min(block_bucket_size,
+                                    self.cache_config.num_gpu_blocks)
+
+            block_mapping = [None] * block_bucket_size
+            block_usage = [None] * block_bucket_size
+            block_scales = [None] * block_bucket_size
+
+            for i, bt in enumerate(block_tables):
+                if bt:
+                    blocks_in_group = len(bt)
+                    scale = 1.0 / blocks_in_group
+                    for b in bt:
+                        if block_mapping[b] is None:
+                            block_mapping[b] = i
+                            block_usage[b] = self.block_size
+                            block_scales[b] = scale
+
+            block_mapping = [b if b is not None else -1 for b in block_mapping]
+            block_scales = [b if b is not None else 0.0 for b in block_scales]
+
+            for bt, sl in zip(block_tables, slot_mapping):
+                if bt:
+                    block_usage[bt[-1]] = sl[-1] % self.block_size + 1
+            block_usage = [u if u is not None else 1 for u in block_usage]
+
+        else:
+            blocks_used = [len(bt) for bt in block_tables if bt]
+            block_list = []
+            block_scales = []
+            for bt in block_tables:
+                block_list.extend(bt)
+                blocks_in_group = len(bt)
+                if blocks_in_group > 0:
+                    scale = 1.0 / blocks_in_group
+                    block_scales.extend([scale] * blocks_in_group)
+
+            block_mapping_nested: List[List[int]] = [
+                [i] * b_u for i, b_u in enumerate(blocks_used)
+            ]
+            block_mapping = list(
+                itertools.chain.from_iterable(block_mapping_nested))
+
+            last_block = [
+                sl % self.block_size + 1
+                for sl in itertools.chain(*slot_mapping)
+            ]
+            block_usage_ = [[self.block_size] * (b_u - 1) + [lb]
+                            for b_u, lb in zip(blocks_used, last_block)]
+            block_usage = list(itertools.chain(*block_usage_))
+
+            block_bucket_size = len(block_list)
+            block_mapping = pad_list(block_mapping, block_bucket_size, -1)
+            block_usage = pad_list(block_usage, block_bucket_size, 1)
+            block_scales = pad_list(block_scales, block_bucket_size, 0.0)
+        block_list = pad_list(block_list, block_bucket_size, _PAD_BLOCK_ID)
+        block_groups = pad_list(block_mapping, block_bucket_size,
+                                len(block_tables))
+        block_list = torch.tensor(block_list,
+                                dtype=torch.int,
+                                device=self.device)
+        block_mapping = torch.tensor(block_mapping,
+                                    dtype=torch.long,
+                                    device=self.device)
+        block_groups = torch.tensor(block_groups,
+                                    dtype=torch.long,
+                                    device=self.device)
+        block_usage = torch.tensor(block_usage,
+                                dtype=self.model_config.dtype,
+                                device=self.device)
+        slot_mapping = torch.tensor(slot_mapping,
+                                    dtype=torch.long,
+                                    device=self.device)
+
+        block_indices, block_offsets = precompute_indices_and_offsets(
+            self.block_size, slot_mapping, False)
+        block_scales = torch.tensor(block_scales,
+                                    dtype=self.model_config.dtype,
+                                    device=self.device)
+
+        return block_list, block_mapping, block_groups, block_usage, block_indices, block_offsets, block_scales
 
     @torch.inference_mode()
     def execute_model(
@@ -611,16 +696,11 @@ class HPUModelRunner:
         attn_metadata, logits_indices = self._prepare_inputs(scheduler_output)
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         batch_size = self.input_batch.num_reqs
-        seq_lens = (self.input_batch.num_computed_tokens_cpu[:batch_size] +
-                    num_scheduled_tokens)
-        max_seq_len = seq_lens.max()
-        num_blocks = math.ceil(max_seq_len / self.block_size) # NOTE(kzawora): it seems like block table is overallocated by 1, but I don't know why. Maybe add +1 here
-        max_blocked_seq_len = num_blocks * self.block_size
+        max_blocked_seq_len = attn_metadata.slot_mapping.shape[1]
 
         seq_len = num_scheduled_tokens
         trimmed_attn_metadata = trim_attn_metadata(attn_metadata)
         with set_forward_context(attn_metadata):
-            import pdb; pdb.set_trace()
             hidden_states = self.model.forward(
                 input_ids=self.input_ids[:batch_size,:max_blocked_seq_len],
                 positions=self.positions[:batch_size,:max_blocked_seq_len],
@@ -637,7 +717,8 @@ class HPUModelRunner:
             logits=logits,
             sampling_metadata=sampling_metadata,
         )
-
+        phase = 'prefill' if attn_metadata.is_prompt else 'decode'
+        logger.info(f'{phase} bs:{batch_size} seq:{max_blocked_seq_len} done!')
         # NOTE: CPU-GPU synchronization happens here.
         sampled_token_ids = sampler_output.sampled_token_ids.cpu()
         sampled_token_ids_list = sampled_token_ids.tolist()
@@ -654,6 +735,8 @@ class HPUModelRunner:
                 token_id = sampled_token_ids_list[i]
                 self.input_batch.token_ids_cpu[i, seq_len] = token_id
                 req_state.output_token_ids.append(token_id)
+                req_state.num_output_tokens += 1
+                self.input_batch.num_output_tokens_cpu += 1
             else:
                 # Ignore the sampled token from the partial request.
                 # Rewind the generator state as if the token was not sampled.

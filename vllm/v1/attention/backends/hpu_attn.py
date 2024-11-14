@@ -72,6 +72,14 @@ class HPUAttentionMetadata(HPUPagedAttentionMetadata, AttentionMetadata):
     # or all decoding. True if all sequences are prompts.
     is_prompt: bool
     attn_bias: Optional[torch.Tensor]
+    
+    # NOTE(sang): Definition of context_len, query_len, and seq_len.
+    # |---------- N-1 iteration --------|
+    # |---------------- N iteration ---------------------|
+    # |- tokenA -|......................|-- newTokens ---|
+    # |---------- context_len ----------|
+    # |-------------------- seq_len ---------------------|
+    #                                   |-- query_len ---|
     seq_lens_tensor: Optional[torch.Tensor]
     context_lens_tensor: Optional[torch.Tensor]
 
@@ -174,7 +182,6 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
         block_indices = attn_metadata.block_indices
         block_offsets = attn_metadata.block_offsets
         if attn_metadata.is_prompt:
-            import pdb; pdb.set_trace()
             key = key.unflatten(0, (block_indices.size(0), -1))
             value = value.unflatten(0, (block_indices.size(0), -1))
         if kv_cache is not None:
