@@ -64,20 +64,39 @@ $ python setup.py develop
 
 - [Offline batched inference](https://github.com/HabanaAI/vllm-fork/blob/habana_main/docs/source/getting_started/quickstart.rst#offline-batched-inference)
 - Online inference via [OpenAI-Compatible Server](https://github.com/HabanaAI/vllm-fork/blob/habana_main/docs/source/getting_started/quickstart.rst#openai-compatible-server)
-- HPU autodetection - no need to manually select device within vLLM
+- HPU autodetection
 - Paged KV cache with algorithms enabled for Intel Gaudi accelerators
 - Custom Intel Gaudi implementations of Paged Attention, KV cache ops, prefill attention, Root Mean Square Layer Normalization, Rotary Positional Encoding
 - Tensor parallelism support for multi-card inference
 - Inference with [HPU Graphs](https://docs.habana.ai/en/latest/PyTorch/Inference_on_PyTorch/Inference_Using_HPU_Graphs.html) for accelerating low-batch latency and throughput
 - Attention with Linear Biases (ALiBi)
 - INC quantization
+- LoRA
+- Multi-step scheduling
+- Automatic prefix caching (experimental)
+
 
 # Unsupported Features
 
-- Beam search
-- LoRA adapters
 - AWQ quantization
 - Prefill chunking (mixed-batch inferencing)
+
+# Support matrix
+
+| **Feature** 	| **Description** 	| **References** 	|
+|---	|---	|---	|
+| Offline batched inference 	| Offline inference using LLM class from vLLM Python API 	| https://docs.vllm.ai/en/stable/getting_started/quickstart.html#offline-batched-inference<br>https://docs.vllm.ai/en/stable/getting_started/examples/offline_inference.html 	|
+| Online inference via OpenAI-Compatible Server 	| Online inference using HTTP server that implements OpenAI Chat and Completions API 	| https://docs.vllm.ai/en/stable/serving/openai_compatible_server.html<br>https://docs.vllm.ai/en/stable/getting_started/examples/openai_chat_completion_client.html 	|
+| HPU autodetection 	| HPU users do not need to specify the target platform, it will be detected automatically upon vLLM startup 	| N/A 	|
+| Paged KV cache with algorithms enabled for Intel Gaudi accelerators 	| vLLM HPU backend contains a custom Paged Attention and cache operators implementations optimized for Gaudi devices. 	| N/A 	|
+| Custom Intel Gaudi operator implementations 	|  	| N/A 	|
+| Tensor parallel inference (single-node multi-HPU) 	|  	| https://docs.vllm.ai/en/latest/serving/distributed_serving.html 	|
+| Inference with HPU Graphs 	|  	| https://docs.habana.ai/en/latest/PyTorch/Inference_on_PyTorch/Inference_Using_HPU_Graphs.html<br>https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html#hpu-graph-capture 	|
+| Attention with Linear Biases (ALiBi) 	|  	| N/A 	|
+| INC quantization 	|  	| https://docs.habana.ai/en/latest/PyTorch/Inference_on_PyTorch/Inference_Using_FP8.html 	|
+| LoRA/MultiLoRA support 	|  	| https://docs.vllm.ai/en/stable/models/lora.html<br>https://docs.vllm.ai/en/stable/getting_started/examples/multilora_inference.html 	|
+| Multi-step scheduling support 	|  	| https://github.com/vllm-project/vllm/issues/6854 	|
+| Automatic prefix caching (experimental) 	|  	| https://docs.vllm.ai/en/stable/automatic_prefix_caching/apc.html<br>https://docs.vllm.ai/en/stable/automatic_prefix_caching/details.html 	|
 
 # Supported Configurations
 
@@ -312,3 +331,103 @@ If you experience device out-of-memory issues or want to attempt inference at hi
 
 - Tweak `gpu_memory_utilization` knob. It will decrease the allocation of KV cache, leaving some headroom for capturing graphs with larger batch size. By default `gpu_memory_utilization` is set to 0.9. It attempts to allocate ~90% of HBM left for KV cache after short profiling run. Note that decreasing reduces the number of KV cache blocks you have available, and therefore reduces the effective maximum number of tokens you can handle at a given time.
 - If this method is not efficient, you can disable `HPUGraph` completely. With HPU Graphs disabled, you are trading latency and throughput at lower batches for potentially higher throughput on higher batches. You can do that by adding `--enforce-eager` flag to server (for online inference), or by passing `enforce_eager=True` argument to LLM constructor (for offline inference).
+
+
+# Changelog
+## 1.19.0
+### New features
+ - Added fake HPU mode to Habana components with dummy habana_frameworks module. (#250)
+ - Enabled HPU Graph capture even when warmup is skipped (#320)
+ - Introduced vllm-hpu-extension, removed vllm.hpu directory and changed relevant imports (#291, #323)
+ - Enabled async output processing for HPU (#342)
+ - Enabled automatic BF16 usage on HPU instead of FP16 (#361)
+ - Added padding-aware scheduling and option to limit prefill batch size (#394)
+ - Overhauled HPU support of RotaryEmbedding (#404)
+ - Added HPU specific arguments to benchmark_throughput (#406)
+ - Added support for long context lengths with LoRA (#418)
+ - Added support for various softmax normalization options (#378, #420)
+ - Added initial support for automatic prefix caching (#162)
+ - Added multi step scheduling HPU support with tensor parallelism support (#441, #457)
+ - Added HPU support for speculative_decoding (#375, #461)
+ - Aligned HPU fork with upstream code up to 6a585a2 (v0.6.3.post1) (#259, #311, #340, #353, #465, #468)
+ 
+### Performance optimizations
+ - Reduced default value of VLLM_GRAPH_RESERVED_MEM to 0.1 (#292)
+ - Added attention performance optimizations: prefill cache write chunking, div_i32 removal from insert_or_update_cache (#289)
+ - Optimized Qwen2 model on Gaudi (#233)
+ - Optimized performance of top_p and top_k calculations (#449)
+ - Removed CPU sync before sampler (#414)
+ - Enabled Contiguous Paged Attention optimization (#424, #433)
+ - Reduced block fragmentation (#426)
+ - Enabled FusedSDPA prefill by default (#447, #448)
+ - Offload logits processing to CPU when guided decoding is used (#358)
+ - Enabled Dynamic MoE layer for Mixtral (#425)
+ - Enabled INC patching matmuls in paged attention's block2batch and batch2block (#500)
+ - Optimized multi-step scheduling deepcopy overhead (#452)
+ - Enabled warmup for multi-step scheduling (#501)
+ 
+### Bugfixes
+ - Fixed LLaVA-1.5 multi-modal model inference (#283)
+ - Fixed blocks number calculation for Flat Paged Attention (#269)
+ - Fixed initialize_ray_cluster device_str bug (#297)
+ - Fixed calculating slots for warmup (#310)
+ - Removed padding block from a list of available blocks in allocators (#313)
+ - Fixed seq_len for padding sequences (#318)
+ - Fixed LoRA specific conditions in profile_run (#317)
+ - Removed throwing "Failed to imported from vllm._C" warning on HPU (#326)
+ - Fixed documentation build warnings (#330)
+ - Fixed INC FP8 inference after rebase (#333)
+ - Refined INC shutdown code (#335)
+ - Fixed torch.compile issue of dispatch key set mismatch (#299)
+ - Fixed runtime errors reported when using long input sequence lengths with LoRA (#339)
+ - Fixed hpu_set_env call in load_model in vllm (#364)
+ - Fixed LoRA tests (#376)
+ - Removed constraints for bucket creation during warmup in LoRA (#382)
+ - Fixed lora_manager tests with hpu_model_runner (#386)
+ - Removed workaround added to resolve multi-card stall issue (#387)
+ - Added workaround for RuntimeError: "fill_cpu" not implemented for 'Float8_e4m3fn' (#402)
+ - Fixed SchedulerConfig params (#459)
+ - Fixed multistep deepcopy overhead (#452)
+ - Added option to disable duplicates in topk (#464)
+ - Enabled lazy import of HPU-dependent components (#363)
+ - Fixed bug: seed_everything function doesn't handle HPU (#384)
+ - Removed redundant set_active_loras call during warmup (#413)
+ - Fixed number of blocks when profiling contiguous paged attention (#496)
+ - Fixed one_hot bug in torch compile mode (#427)
+
+
+### Other
+ - Updated SynapseAI version in README & Dockerfile (#390)
+ - Updated documentation on support of FP8 (#288)
+ - Added FP8 inference procedure (#504)
+ - Fixed broken urls in gaudi-installation (#473)
+ - Renamed vLLM components from Habana to HPU (#359)
+
+
+
+## 1.18.0
+### New features
+ - Added support FP8 INC inference (#144)
+ - Added support for FusedSDPA prefills (#168)
+ - Enabled LoRA support for HPU (#170, #247)
+ - Enabled buckets not warmed-up warnings (#222)
+ - Enabled Flat Paged Attention optimization (#169)
+ - Added disable_tensor_cache=True to HPUGraph capture (#252)
+ - Added support for Mixtral quantization using INC (#267)
+ - Added option to skip forward pass execution during warmup (#227)
+ - Added PyTorch profiler integration (#256)
+ - Added Dockerfile.hpu (#200)
+ - Added topp/topk calculation sampler optimization (#195)
+### Bugfixes
+ - HPU Buckets now don't exceed token budget (#206)
+ - Fixed bug causing incorrect lower bucket bounadry calculation (#239)
+ - Fixed ALiBi support (#254)
+ - Fixed HPU guided decoding crashes (#236)
+ - Fixed incorrect handlign of large bucket minimums (#235)
+ - Issued Llama-405b workaround for memory allocation error (#184)
+ - Enabled dispersed dummy cache slots for avoiding caching issues (#243)
+ - Eliminated Llama and GPTBigCode graph breaks in torch.compile mode (#202)
+
+ 
+
+
