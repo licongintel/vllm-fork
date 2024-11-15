@@ -85,18 +85,18 @@ $ python setup.py develop
 
 | **Feature** 	| **Description** 	| **References** 	|
 |---	|---	|---	|
-| Offline batched inference 	| Offline inference using LLM class from vLLM Python API 	| https://docs.vllm.ai/en/stable/getting_started/quickstart.html#offline-batched-inference<br>https://docs.vllm.ai/en/stable/getting_started/examples/offline_inference.html 	|
-| Online inference via OpenAI-Compatible Server 	| Online inference using HTTP server that implements OpenAI Chat and Completions API 	| https://docs.vllm.ai/en/stable/serving/openai_compatible_server.html<br>https://docs.vllm.ai/en/stable/getting_started/examples/openai_chat_completion_client.html 	|
+| Offline batched inference 	| Offline inference using LLM class from vLLM Python API 	| [Quickstart](https://docs.vllm.ai/en/stable/getting_started/quickstart.html#offline-batched-inference)<br>[Example](https://docs.vllm.ai/en/stable/getting_started/examples/offline_inference.html) 	|
+| Online inference via OpenAI-Compatible Server 	| Online inference using HTTP server that implements OpenAI Chat and Completions API 	| [Documentation](https://docs.vllm.ai/en/stable/serving/openai_compatible_server.html)<br>[Example](https://docs.vllm.ai/en/stable/getting_started/examples/openai_chat_completion_client.html) 	|
 | HPU autodetection 	| HPU users do not need to specify the target platform, it will be detected automatically upon vLLM startup 	| N/A 	|
 | Paged KV cache with algorithms enabled for Intel Gaudi accelerators 	| vLLM HPU backend contains a custom Paged Attention and cache operators implementations optimized for Gaudi devices. 	| N/A 	|
-| Custom Intel Gaudi operator implementations 	|  	| N/A 	|
-| Tensor parallel inference (single-node multi-HPU) 	|  	| https://docs.vllm.ai/en/latest/serving/distributed_serving.html 	|
-| Inference with HPU Graphs 	|  	| https://docs.habana.ai/en/latest/PyTorch/Inference_on_PyTorch/Inference_Using_HPU_Graphs.html<br>https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html#hpu-graph-capture 	|
-| Attention with Linear Biases (ALiBi) 	|  	| N/A 	|
-| INC quantization 	|  	| https://docs.habana.ai/en/latest/PyTorch/Inference_on_PyTorch/Inference_Using_FP8.html 	|
-| LoRA/MultiLoRA support 	|  	| https://docs.vllm.ai/en/stable/models/lora.html<br>https://docs.vllm.ai/en/stable/getting_started/examples/multilora_inference.html 	|
-| Multi-step scheduling support 	|  	| https://github.com/vllm-project/vllm/issues/6854 	|
-| Automatic prefix caching (experimental) 	|  	| https://docs.vllm.ai/en/stable/automatic_prefix_caching/apc.html<br>https://docs.vllm.ai/en/stable/automatic_prefix_caching/details.html 	|
+| Custom Intel Gaudi operator implementations 	| vLLM HPU backend provides optimized implementations of operators such as prefill attention, Root Mean Square Layer Normalization, Rotary Positional Encoding. 	| N/A 	|
+| Tensor parallel inference (single-node multi-HPU) 	| vLLM HPU backend support multi-HPU inference across a single node with tensor parallelism. 	| [Documentation](https://docs.vllm.ai/en/latest/serving/distributed_serving.html) 	|
+| Inference with HPU Graphs 	| TODO 	| [Documentation](https://docs.habana.ai/en/latest/PyTorch/Inference_on_PyTorch/Inference_Using_HPU_Graphs.html)<br>[Optimization guide](https://docs.vllm.ai/en/latest/getting_started/gaudi-installation.html#hpu-graph-capture) 	|
+| Attention with Linear Biases (ALiBi) 	| TODO 	| N/A 	|
+| INC quantization 	| TODO 	| [Documentation](https://docs.habana.ai/en/latest/PyTorch/Inference_on_PyTorch/Inference_Using_FP8.html) 	|
+| LoRA/MultiLoRA support 	| TODO 	| [Documentation](https://docs.vllm.ai/en/stable/models/lora.html)<br>[Example](https://docs.vllm.ai/en/stable/getting_started/examples/multilora_inference.html) 	|
+| Multi-step scheduling support 	| TODO 	| [Feature RFC](https://github.com/vllm-project/vllm/issues/6854) 	|
+| Automatic prefix caching (experimental) 	| TODO 	| [Documentation](https://docs.vllm.ai/en/stable/automatic_prefix_caching/apc.html)<br>[Details](https://docs.vllm.ai/en/stable/automatic_prefix_caching/details.html) 	|
 
 # Supported Configurations
 
