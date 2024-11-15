@@ -167,8 +167,8 @@ class Scheduler:
                     running_all_prefill = all(req.num_output_tokens == 0 for req in self.running)
                     request_is_prefill = request.num_output_tokens == 0
                     is_queue_prefill = running_all_prefill and request_is_prefill
+                    import pdb; pdb.set_trace()
                     if not is_queue_prefill and not is_queue_decode:
-                        skipped_reqs.append(request)
                         break
 
                 self.running.append(request)

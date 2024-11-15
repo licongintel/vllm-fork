@@ -100,7 +100,6 @@ class HpuModelAdapter:
                             self.block_size,
                             device=device,
                             dtype=torch.int32).unsqueeze(0)
-        import pdb; pdb.set_trace()
         mask = mask >= metadata.block_usage.unsqueeze(-1)
         attn_bias = (torch.zeros_like(mask, dtype=dtype).masked_fill_(
             mask, -math.inf))
@@ -494,7 +493,6 @@ class HPUModelRunner:
         block_indices, block_offsets = precompute_indices_and_offsets(self.block_size, slot_mapping, is_prompt)
         if not is_prompt:
             block_list, block_mapping, block_groups, block_usage, block_scales = self.get_habana_paged_attn_buffers(block_table_list, slot_mapping_list)
-            import pdb; pdb.set_trace()
         attn_metadata = HPUAttentionMetadata(
             is_prompt=is_prompt,
             block_list=block_list,
@@ -575,7 +573,6 @@ class HPUModelRunner:
             block_usage = [u if u is not None else 1 for u in block_usage]
 
         else:
-            import pdb; pdb.set_trace()
             blocks_used = [len(bt) for bt in block_tables if bt is not None]
             block_list = []
             block_scales = []
@@ -608,7 +605,6 @@ class HPUModelRunner:
         block_list = pad_list(block_list, block_bucket_size, _PAD_BLOCK_ID)
         block_groups = pad_list(block_mapping, block_bucket_size,
                                 len(block_tables))
-        import pdb; pdb.set_trace() 
         block_list_tensor = torch.empty(len(block_list),
                                 dtype=torch.int,
                                 device=self.device)
@@ -645,7 +641,6 @@ class HPUModelRunner:
         self,
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput:
-        import pdb; pdb.set_trace()
         self._update_states(scheduler_output)
         attn_metadata, logits_indices = self._prepare_inputs(scheduler_output)
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
@@ -714,7 +709,6 @@ class HPUModelRunner:
             logprob_token_ids_cpu=logprob_token_ids,
             logprobs_cpu=logprobs,
         )
-        import pdb; pdb.set_trace()
         return model_runner_output
 
     def load_model(self) -> None:
