@@ -30,6 +30,7 @@ from vllm_hpu_extension.ops import batch2block, block2batch
 import habana_frameworks.torch as htorch
 if TYPE_CHECKING:
     from vllm.v1.core.scheduler import SchedulerOutput
+from vllm.v1.engine.detokenizer import Detokenizer
 
 logger = init_logger(__name__)
 
@@ -333,7 +334,8 @@ class HPUModelRunner:
         self.speculative_config = vllm_config.speculative_config
         self.prompt_adapter_config = vllm_config.prompt_adapter_config
         self.observability_config = vllm_config.observability_config
-
+        #TODO(kzawora): remove this, this is for debug purposes only
+        self._tokenizer = Detokenizer(vllm_config.model_config.tokenizer).tokenizer
         model_config = self.model_config
         cache_config = self.cache_config
         scheduler_config = self.scheduler_config
@@ -841,7 +843,6 @@ class HPUModelRunner:
             # POSITIONS.
             positions = self.prefill_positions[:, :padded_prompt_len]
             prefill_position_ids.append(positions.to(self.device))
-
             # SLOT_MAPPING.
             # The "slot" is the "physical index" of a token in the KV cache.
             # Look up the block_idx in the block table (logical<>physical map)
@@ -858,13 +859,13 @@ class HPUModelRunner:
             # ATTN_METADATA.
             prefill_attn_metadata.append(
                 HPUAttentionMetadata.make_prefill_metadata(
-                    seq_lens_tensor=torch.tensor(padded_prompt_len,
+                    seq_lens_tensor=torch.tensor(prompt_len,
                                                  device=self.device),
                     num_prefills=1,
-                    num_prefill_tokens=padded_prompt_len,
+                    num_prefill_tokens=prompt_len,
                     slot_mapping=slot_mapping.to(self.device),
                 ))
-            prefill_logits_indices.append(prompt_len)
+            prefill_logits_indices.append(prompt_len-1)
 
         return PrefillInputData(
             request_ids=prefill_request_ids,
@@ -1034,6 +1035,8 @@ class HPUModelRunner:
             req_idx = self.input_batch.req_id_to_index[req_id]
             self.input_batch.token_ids_cpu[req_idx, seq_len] = token_id
             req_state.output_token_ids.append(token_id)
+            detokenized = self._tokenizer.decode(token_id) if token_id >= 0 and token_id <= len(self._tokenizer) else 'INVALID!!!'
+            logger.info(f"[ENGINE_ITER {self._ENGINE_ITER}] Prefill {idx} generated token id: {token_id} ({detokenized!r}).")
         return sampled_token_ids, logprobs, logprob_token_ids
 
     def _execute_model_decode(self, scheduler_output, decode_data, sampled_token_ids, logprobs, logprob_token_ids):
@@ -1086,6 +1089,8 @@ class HPUModelRunner:
                 token_id = sampled_token_ids_list[i]
                 self.input_batch.token_ids_cpu[i, seq_len] = token_id
                 req_state.output_token_ids.append(token_id)
+                detokenized = self._tokenizer.decode(token_id) if token_id >= 0 and token_id <= len(self._tokenizer) else 'INVALID!!!'
+                logger.info(f"[ENGINE_ITER {self._ENGINE_ITER}] Decode {i} generated token id: {token_id} ({detokenized!r}).")
 
         ######################### PREFILLS #########################
         # Prefills run separately with shape [1, padded_prefill_len],
@@ -1101,7 +1106,16 @@ class HPUModelRunner:
             logprob_token_ids_cpu=logprob_token_ids,
             logprobs_cpu=logprobs,
         )
+        import pdb; pdb.set_trace()
         logger.info(f'[ENGINE_ITER {self._ENGINE_ITER}] Engine iteration done!')
+        if False:
+            for i in range(num_reqs):
+                req_id = self.input_batch.req_ids[i]
+                req_idx = self.input_batch.req_id_to_index[req_id]
+                token_ids = self.input_batch.token_ids_cpu[req_idx]
+                prompt = self._tokenizer.decode(token_ids[:self.input_batch.num_prompt_tokens_cpu[req_idx]])
+                generated = self._tokenizer.decode(token_ids[self.input_batch.num_prompt_tokens_cpu[req_idx]:max(self.input_batch.num_prompt_tokens_cpu[req_idx],self.input_batch.num_computed_tokens_cpu[req_idx])])
+                logger.info(f'[ENGINE_ITER {self._ENGINE_ITER}] REQ:{req_id} IDX:{req_idx} generated token: {self._tokenizer.decode(sampled_token_ids[req_idx])!r}, all generated so far: {generated!r}')
         self._ENGINE_ITER += 1
         return model_runner_output
 

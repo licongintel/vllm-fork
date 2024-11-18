@@ -1197,21 +1197,21 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
 
         attn_metadata = self.attn_backend.make_metadata(
             is_prompt=False,
-            block_list=block_list,
             block_mapping=None,
-            block_usage=block_usage,
             block_indices=None,
             block_offsets=None,
             block_scales=None,
-            block_groups=block_groups,
             attn_bias=None,
             seq_lens_tensor=None,
             context_lens_tensor=None,
             num_prefills=0,
             num_prefill_tokens=0,
+            multi_modal_placeholder_index_maps=None,
+            block_list=block_list,
+            block_usage=block_usage,
+            block_groups=block_groups,
             num_decode_tokens=num_decode_tokens,
-            slot_mapping=slot_mapping,
-            multi_modal_placeholder_index_maps=None)
+            slot_mapping=slot_mapping)
         return PrepareDecodeMetadata(input_tokens=input_tokens,
                                      input_positions=input_positions,
                                      attn_metadata=attn_metadata,
