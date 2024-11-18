@@ -413,6 +413,7 @@ class HpuModelAdapter:
     def forward(self, *args, **kwargs):
         kwargs = kwargs.copy()
         selected_token_indices = kwargs.pop('selected_token_indices')
+        logger.info(f'decode logits_indices: {selected_token_indices}')
         if 'warmup_mode' in kwargs:
             kwargs.pop('warmup_mode')
         input_ids = kwargs['input_ids']
@@ -1194,7 +1195,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             self.device, non_blocking=True)
         slot_mapping = slot_mapping.to(  # type: ignore
             self.device, non_blocking=True)
-
+        logger.info(f'decode positions: {input_positions}')
         attn_metadata = self.attn_backend.make_metadata(
             is_prompt=False,
             block_mapping=None,

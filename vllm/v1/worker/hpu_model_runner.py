@@ -4,7 +4,7 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -64,6 +64,14 @@ class DecodeInputData:
     position_ids: Optional[torch.Tensor] = None
     attn_metadata: HPUAttentionMetadata = None
     logits_indices: Optional[torch.Tensor] = None
+
+
+def flatten(in_list):
+    return list(itertools.chain(*in_list))
+
+
+def gather_list(input, indices, v):
+    return [input[i] if i is not None else v for i in indices]
 
 
 def _get_padded_batch_size(batch_size: int) -> int:
@@ -335,7 +343,8 @@ class HPUModelRunner:
         self.prompt_adapter_config = vllm_config.prompt_adapter_config
         self.observability_config = vllm_config.observability_config
         #TODO(kzawora): remove this, this is for debug purposes only
-        self._tokenizer = Detokenizer(vllm_config.model_config.tokenizer).tokenizer
+        self._tokenizer = Detokenizer(
+            vllm_config.model_config.tokenizer).tokenizer
         model_config = self.model_config
         cache_config = self.cache_config
         scheduler_config = self.scheduler_config
@@ -392,6 +401,9 @@ class HPUModelRunner:
             range(self.max_model_len),
             device="cpu",
         ).to(torch.int32).reshape(1, -1)
+
+        self.use_contiguous_pa = os.environ.get('VLLM_CONTIGUOUS_PA',
+                                                'true').lower() == 'true'
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         # Remove stopped requests from the cached states.
@@ -470,156 +482,19 @@ class HPUModelRunner:
         removed_req_indices = sorted(removed_req_indices, reverse=True)
         if removed_req_indices:
             self.input_batch.condense(removed_req_indices)
-        
+
         # ALL THE PREFILLS ARE THE LAST M IN THE BATCH.
         # These are added at the end after the bacth is condensed.
         self.input_batch.num_prefills = len(req_ids_to_add)
         for req_id in req_ids_to_add:
             req_state = self.requests[req_id]
             self.input_batch.add_request(req_state, None)
-            
-    
-    def _prepare_inputs_old(self, scheduler_output: "SchedulerOutput"):
-        total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        assert total_num_scheduled_tokens > 0
-        num_reqs = self.input_batch.num_reqs
-        assert num_reqs > 0
-        assert not self.input_batch.mixed_batch, "Prefill chunking is not supported on HPU"
-        is_prompt = self.input_batch.all_prefill
-        is_decode = self.input_batch.all_decode
-        num_prefills = num_reqs if is_prompt else 0
-        num_decodes = num_reqs if is_decode else 0
 
-        # OPTIMIZATION: Start copying the block table first.
-        # This way, we can overlap the copy with the following CPU operations.
-        self.input_batch.block_table[:num_reqs].copy_(
-            self.input_batch.block_table_cpu_tensor[:num_reqs],
-            non_blocking=True)
-
-        # Get the number of scheduled tokens for each request.
-        # TODO: The Python loop can be slow. Optimize.
-        num_scheduled_tokens = []
-        max_num_scheduled_tokens = 0
-        for req_id in self.input_batch.req_ids[:num_reqs]:
-            num_tokens = scheduler_output.num_scheduled_tokens[req_id]
-            num_scheduled_tokens.append(num_tokens)
-            max_num_scheduled_tokens = max(max_num_scheduled_tokens,
-                                           num_tokens)
-        num_scheduled_tokens = np.array(num_scheduled_tokens, dtype=np.int32)
-        assert max_num_scheduled_tokens > 0
-
-        # NOTE(kzawora): In prefills, when prefix caching is enabled (on by
-        # default), num_computed_tokens_cpu might be non-zero even for first
-        # batch. This is a new behavior in V1 - KVs can be cached even within
-        # the same iteration
-        seq_lens = (self.input_batch.num_computed_tokens_cpu[:num_reqs] +
-                    num_scheduled_tokens)
-        context_lens = self.input_batch.num_computed_tokens_cpu[:num_reqs]
-        max_seq_len = seq_lens.max()
-        num_blocks = math.ceil(
-            max_seq_len / self.block_size
-        )  # NOTE(kzawora): it seems like block table is overallocated by 1, but I don't know why. Maybe add +1 here
-        max_blocked_seq_len = num_blocks * self.block_size
-
-        # Get batched arange.
-        # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-        arange_matrix = np.tile(np.arange(max_blocked_seq_len), (num_reqs, 1))
-        mask = arange_matrix < num_scheduled_tokens[:, np.newaxis]
-        arange_matrix[~mask] = 0
-
-        # Calculate the slot mapping.
-        block_table = self.input_batch.block_table_cpu_tensor[:num_reqs, :
-                                                              num_blocks]
-        block_table_list = block_table.tolist()
-        slot_mapping = torch.add(
-            torch.repeat_interleave(torch.mul(block_table, self.block_size),
-                                    self.block_size,
-                                    dim=1), torch.from_numpy(arange_matrix))
-        slot_mapping.masked_fill_(torch.from_numpy(~mask), 0)
-        slot_mapping_list = slot_mapping.tolist()
-
-        # NOTE(kzawora): this is probably dumb
-        input_ids = self.input_batch.token_ids_cpu[:num_reqs, :
-                                                   max_blocked_seq_len]
-        positions = [
-            list(range(context_len, seq_len))
-            for context_len, seq_len in zip(context_lens, seq_lens)
-        ]  # idk what to do here
-        self.input_ids[:num_reqs, :max_blocked_seq_len].copy_(
-            torch.from_numpy(input_ids), non_blocking=True)
-
-        query_start_loc = torch.empty((num_reqs + 1, ),
-                                      dtype=torch.int32,
-                                      device="cpu",
-                                      pin_memory=self.pin_memory)
-        query_start_loc_np = query_start_loc.numpy()
-        query_start_loc_np[0] = 0
-        np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1:])
-
-        positions = make_tensor_with_pad(positions,
-                                         max_len=max_blocked_seq_len,
-                                         pad=0,
-                                         dtype=torch.long,
-                                         device=self.device)
-        self.positions[:num_reqs, :max_blocked_seq_len].copy_(
-            positions, non_blocking=True)
-        seq_lens_tensor = torch.empty((num_reqs, ),
-                                      dtype=torch.int32,
-                                      device="cpu",
-                                      pin_memory=self.pin_memory)
-        context_lens_tensor = torch.empty((num_reqs, ),
-                                          dtype=torch.int32,
-                                          device="cpu",
-                                          pin_memory=self.pin_memory)
-        seq_lens_tensor[:num_reqs].copy_(torch.from_numpy(seq_lens),
-                                         non_blocking=True)
-        context_lens_tensor[:num_reqs].copy_(torch.from_numpy(context_lens),
-                                             non_blocking=True)
-        query_start_loc = query_start_loc.to(self.device, non_blocking=True)
-        slot_mapping = slot_mapping.to(self.device, non_blocking=True).long()
-        seq_lens_tensor = seq_lens_tensor.to(self.device, non_blocking=True)
-        context_lens_tensor = context_lens_tensor.to(self.device,
-                                                     non_blocking=True)
-        block_list, block_mapping, block_groups, block_usage, block_scales = None, None, None, None, None
-        block_indices, block_offsets = precompute_indices_and_offsets(
-            self.block_size, slot_mapping, is_prompt)
-        if not is_prompt:
-            block_list, block_mapping, block_groups, block_usage, block_scales = self.get_habana_paged_attn_buffers(
-                block_table_list, slot_mapping_list)
-        attn_metadata = HPUAttentionMetadata(
-            is_prompt=is_prompt,
-            block_list=block_list,
-            block_mapping=block_mapping,
-            block_usage=block_usage,
-            block_indices=block_indices,
-            block_offsets=block_offsets,
-            block_scales=block_scales,
-            block_groups=block_groups,
-            attn_bias=None,
-            seq_lens_tensor=seq_lens_tensor,  # FIXME(kzawora)
-            context_lens_tensor=context_lens_tensor,  # FIXME(kzawora)
-            num_prefills=num_prefills,
-            num_prefill_tokens=total_num_scheduled_tokens if is_prompt else 0,
-            num_decode_tokens=total_num_scheduled_tokens if is_decode else 0,
-            slot_mapping=slot_mapping,
-            multi_modal_placeholder_index_maps=
-            None  # FIXME(kzawora): mutli-modality will not work here
-        )
-        # NOTE(woosuk): Due to chunked prefills, there can be at most 1 partial
-        # request in the batch. While we should not sample any token from this
-        # partial request, we do so for simplicity. We will ignore the sampled
-        # token from the partial request.
-        # TODO: Support prompt logprobs.
-        logits_indices = query_start_loc[1:] - 1
-        return attn_metadata, logits_indices
-
-    def _prepare_sampling(
-        self,
-        scheduler_output: "SchedulerOutput",
-        prefill_only : bool = False,
-        decode_only : bool = False,
-        seq_idx : Optional[int] = None
-    ) -> SamplingMetadata:
+    def _prepare_sampling(self,
+                          scheduler_output: "SchedulerOutput",
+                          prefill_only: bool = False,
+                          decode_only: bool = False,
+                          seq_idx: Optional[int] = None) -> SamplingMetadata:
         skip_copy = True
         if (scheduler_output.finished_req_ids
                 or scheduler_output.preempted_req_ids):
@@ -628,185 +503,69 @@ class HPUModelRunner:
                 or scheduler_output.scheduled_resumed_reqs):
             skip_copy = False
         # Create the sampling metadata.
-        sampling_metadata = self.input_batch.make_sampling_metadata(skip_copy=skip_copy, prefill_only=prefill_only, decode_only=decode_only, seq_idx=seq_idx)
+        sampling_metadata = self.input_batch.make_sampling_metadata(
+            skip_copy=skip_copy,
+            prefill_only=prefill_only,
+            decode_only=decode_only,
+            seq_idx=seq_idx)
         return sampling_metadata
 
     def get_habana_paged_attn_buffers(self, block_tables, slot_mapping):
-        block_mapping: Union[List[Union[None, int]], torch.Tensor]
-        block_usage: Union[List[Union[None, int]], torch.Tensor]
-        block_scales: Union[List[Union[None, float]], torch.Tensor]
-        block_list: Union[List[int], torch.Tensor]
 
-        if True: #self.use_contiguous_pa:
-            block_list = list(itertools.chain(*block_tables))
-            max_idx = max(block_list)
-            max_blocks = max(max_idx + 1, len(block_list))
-            block_bucket_size = max_blocks
-            block_bucket_size = min(block_bucket_size,
-                                    self.cache_config.num_gpu_blocks)
+        last_block_usage = [
+            slot[0] % self.block_size + 1 for slot in slot_mapping
+        ]
+        block_groups = [[i] * len(bt) for i, bt in enumerate(block_tables)]
+        block_usage = [[self.block_size] * (len(bt) - 1) + [lbu]
+                       for bt, lbu in zip(block_tables, last_block_usage)
+                       if bt is not None]
 
-            block_mapping = [None] * block_bucket_size
-            block_usage = [None] * block_bucket_size
-            block_scales = [None] * block_bucket_size
+        block_list = flatten(block_tables)
+        block_groups = flatten(block_groups)
+        block_usage = flatten(block_usage)
 
-            for i, bt in enumerate(block_tables):
-                if bt is not None:
-                    blocks_in_group = len(bt)
-                    scale = 1.0 / blocks_in_group
-                    for b in bt:
-                        if block_mapping[b] is None:
-                            block_mapping[b] = i
-                            block_usage[b] = self.block_size
-                            block_scales[b] = scale
+        assert len(block_list) == len(block_groups)
+        assert len(block_list) == len(block_usage)
 
-            block_mapping = [b if b is not None else -1 for b in block_mapping]
-            block_scales = [b if b is not None else 0.0 for b in block_scales]
-
-            for bt, sl in zip(block_tables, slot_mapping):
-                if bt is not None:
-                    block_usage[bt[-1]] = sl[-1] % self.block_size + 1
-            block_usage = [u if u is not None else 1 for u in block_usage]
-
+        padding_fn = None
+        if self.use_contiguous_pa:
+            block_bucket_size = max(max(block_list) + 1, len(block_list))
+            #block_bucket_size = find_bucket(
+            #    block_bucket_size,
+            #    self.bucketing_global_state.decode_block_bucket_cfg)
+            indices: List[Any]
+            indices = [None] * block_bucket_size
+            for i, bid in enumerate(block_list):
+                indices[bid] = i
+            padding_fn = lambda tensor, pad_value: gather_list(
+                tensor, indices, pad_value)
         else:
-            blocks_used = [len(bt) for bt in block_tables if bt is not None]
-            block_list = []
-            block_scales = []
-            for bt in block_tables:
-                block_list.extend(bt)
-                blocks_in_group = len(bt)
-                if blocks_in_group > 0:
-                    scale = 1.0 / blocks_in_group
-                    block_scales.extend([scale] * blocks_in_group)
-
-            block_mapping_nested: List[List[int]] = [
-                [i] * b_u for i, b_u in enumerate(blocks_used)
-            ]
-            block_mapping = list(
-                itertools.chain.from_iterable(block_mapping_nested))
-
-            last_block = [
-                sl % self.block_size + 1
-                for sl in itertools.chain(*slot_mapping)
-            ]
-            block_usage_ = [[self.block_size] * (b_u - 1) + [lb]
-                            for b_u, lb in zip(blocks_used, last_block)]
-            block_usage = list(itertools.chain(*block_usage_))
-
             block_bucket_size = len(block_list)
-            block_mapping = pad_list(block_mapping, block_bucket_size, -1)
-            block_usage = pad_list(block_usage, block_bucket_size, 1)
-            block_scales = pad_list(block_scales, block_bucket_size, 0.0)
+            #block_bucket_size = find_bucket(
+            #    len(block_list),
+            #    self.bucketing_global_state.decode_block_bucket_cfg)
+            padding_fn = lambda tensor, pad_value: pad_list(
+                tensor, block_bucket_size, pad_value)
 
-        block_list = pad_list(block_list, block_bucket_size, _PAD_BLOCK_ID)
-        block_groups = pad_list(block_mapping, block_bucket_size,
-                                len(block_tables))
-        block_list_tensor = torch.empty(len(block_list),
-                                        dtype=torch.int,
-                                        device=self.device)
-        block_list_tensor.copy_(torch.tensor(block_list), non_blocking=True)
+        block_list = padding_fn(block_list, _PAD_BLOCK_ID)
+        block_groups = padding_fn(block_groups, -1)
+        block_usage = padding_fn(block_usage, 1)
 
-        block_mapping_tensor = torch.empty(len(block_mapping),
-                                           dtype=torch.long,
-                                           device=self.device)
-        block_mapping_tensor.copy_(torch.tensor(block_mapping),
-                                   non_blocking=True)
+        block_list = torch.tensor(block_list, dtype=torch.int, device='cpu')
+        block_groups = torch.tensor(block_groups,
+                                    dtype=torch.int,
+                                    device='cpu')
+        block_usage = torch.tensor(block_usage,
+                                   dtype=self.model_config.dtype,
+                                   device='cpu')
 
-        block_groups_tensor = torch.empty(len(block_groups),
-                                          dtype=torch.long,
-                                          device=self.device)
-        block_groups_tensor.copy_(torch.tensor(block_groups),
-                                  non_blocking=True)
-
-        block_usage_tensor = torch.empty(len(block_usage),
-                                         dtype=self.model_config.dtype,
-                                         device=self.device)
-        block_usage_tensor.copy_(
-            torch.tensor(
-                block_usage),  # <- why do I see a device deadlock here??? 
-            non_blocking=True)
-
-        block_scales_tensor = torch.empty(len(block_scales),
-                                          dtype=self.model_config.dtype,
-                                          device=self.device)
-        block_scales_tensor.copy_(torch.tensor(block_scales),
-                                  non_blocking=True)
-
-        return block_list_tensor, block_mapping_tensor, block_groups_tensor, block_usage_tensor, block_scales_tensor
-
-    @torch.inference_mode()
-    def execute_model_old(
-        self,
-        scheduler_output: "SchedulerOutput",
-    ) -> ModelRunnerOutput:
-        self._update_states(scheduler_output)
-        attn_metadata, logits_indices = self._prepare_inputs(scheduler_output)
-        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        batch_size = self.input_batch.num_reqs
-        max_blocked_seq_len = attn_metadata.slot_mapping.shape[1]
-
-        seq_len = num_scheduled_tokens
-        trimmed_attn_metadata = trim_attn_metadata(attn_metadata)
-        with set_forward_context(attn_metadata):
-            hidden_states = self.model.forward(
-                input_ids=self.input_ids[:batch_size, :max_blocked_seq_len],
-                positions=self.positions[:batch_size, :max_blocked_seq_len],
-                kv_caches=self.kv_caches,
-                attn_metadata=trimmed_attn_metadata,
-            )
-        hidden_states = hidden_states[:num_scheduled_tokens]
-        hidden_states = hidden_states.index_select(0, logits_indices)
-        logits = self.model.compute_logits(hidden_states, None)
-
-        # Sample the next token and get logprobs if needed.
-        sampling_metadata = self._prepare_sampling(scheduler_output)
-        sampler_output = self.model.sample(
-            logits=logits,
-            sampling_metadata=sampling_metadata,
-        )
-        phase = 'prefill' if attn_metadata.is_prompt else 'decode'
-        logger.info(f'{phase} bs:{batch_size} seq:{max_blocked_seq_len} done!')
-        # NOTE: CPU-GPU synchronization happens here.
-        sampled_token_ids = sampler_output.sampled_token_ids.cpu()
-        sampled_token_ids_list = sampled_token_ids.tolist()
-        # TODO(woosuk): The following loop can be slow since it iterates over
-        # the requests one by one. Optimize.
-        num_reqs = self.input_batch.num_reqs
-        for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-            req_state = self.requests[req_id]
-            seq_len = (req_state.num_computed_tokens +
-                       scheduler_output.num_scheduled_tokens[req_id])
-            assert seq_len <= req_state.num_tokens
-            if seq_len == req_state.num_tokens:
-                # Append the sampled token to the output token ids.
-                token_id = sampled_token_ids_list[i]
-                self.input_batch.token_ids_cpu[i, seq_len] = token_id
-                req_state.output_token_ids.append(token_id)
-                #req_state.num_output_tokens += 1
-                #self.input_batch.num_output_tokens_cpu[i] += 1
-            else:
-                # Ignore the sampled token from the partial request.
-                # Rewind the generator state as if the token was not sampled.
-                generator = self.input_batch.generators.get(i)
-                if generator is not None:
-                    # This relies on cuda-specific torch-internal impl details
-                    generator.set_offset(generator.get_offset() - 4)
-
-        if sampler_output.logprob_token_ids is None:
-            logprob_token_ids = None
-        else:
-            logprob_token_ids = sampler_output.logprob_token_ids.cpu()
-        if sampler_output.logprobs is None:
-            logprobs = None
-        else:
-            logprobs = sampler_output.logprobs.cpu()
-        model_runner_output = ModelRunnerOutput(
-            req_ids=self.input_batch.req_ids[:num_reqs],
-            req_id_to_index=self.input_batch.req_id_to_index,
-            sampled_token_ids_cpu=sampled_token_ids,
-            logprob_token_ids_cpu=logprob_token_ids,
-            logprobs_cpu=logprobs,
-        )
-        return model_runner_output
+        block_list = block_list.to(  # type: ignore
+            self.device, non_blocking=True)
+        block_groups = block_groups.to(  # type: ignore
+            self.device, non_blocking=True)
+        block_usage = block_usage.to(  # type: ignore
+            self.device, non_blocking=True)
+        return block_list, block_groups, block_usage
 
     def _prepare_prefill_inputs(
         self,
@@ -821,7 +580,7 @@ class HPUModelRunner:
         prefill_position_ids = []
         prefill_attn_metadata = []
         prefill_logits_indices = []
-        
+
         # DECODES are the first num_decodes REQUESTS.
         # PREFILLS are the next num_reqs - num_decodes REQUESTS.
         num_reqs = self.input_batch.num_reqs
@@ -865,18 +624,17 @@ class HPUModelRunner:
                     num_prefill_tokens=prompt_len,
                     slot_mapping=slot_mapping.to(self.device),
                 ))
-            prefill_logits_indices.append(prompt_len-1)
+            prefill_logits_indices.append(prompt_len - 1)
 
-        return PrefillInputData(
-            request_ids=prefill_request_ids,
-            prompt_lens=prefill_prompt_lens,
-            token_ids=prefill_token_ids,
-            position_ids=prefill_position_ids,
-            attn_metadata=prefill_attn_metadata,
-            logits_indices=prefill_logits_indices
-        )
+        return PrefillInputData(request_ids=prefill_request_ids,
+                                prompt_lens=prefill_prompt_lens,
+                                token_ids=prefill_token_ids,
+                                position_ids=prefill_position_ids,
+                                attn_metadata=prefill_attn_metadata,
+                                logits_indices=prefill_logits_indices)
 
-    def _prepare_decode_inputs(self, num_decodes: int, scheduler_output) -> DecodeInputData:
+    def _prepare_decode_inputs(self, num_decodes: int,
+                               scheduler_output) -> DecodeInputData:
         # Decodes run as one single padded batch with shape [batch, 1]
         #
         # We need to set _PAD_SLOT_ID for the padding tokens in the
@@ -920,12 +678,14 @@ class HPUModelRunner:
         slot_mapping = slot_mapping[:padded_batch_size]
 
         # BLOCK_TABLE [batch, max_num_blocks_per_req]
-        block_table = self.input_batch.block_table_cpu_tensor[:padded_batch_size]
+        block_table = self.input_batch.block_table_cpu_tensor[:
+                                                              padded_batch_size]
         # CONTEXT_LENS [batch_size]
         context_lens = (positions.reshape(-1) + 1)
 
-        block_list_tensor, _, block_groups_tensor, block_usage_tensor, _ = self.get_habana_paged_attn_buffers(block_table, slot_mapping)
-        
+        block_list, block_groups, block_usage = self.get_habana_paged_attn_buffers(
+            block_table, slot_mapping)
+
         num_scheduled_tokens = []
         max_num_scheduled_tokens = 0
         for req_id in self.input_batch.req_ids[:num_decodes]:
@@ -943,15 +703,24 @@ class HPUModelRunner:
         np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1:])
         logits_indices = query_start_loc[1:] - 1
         # CPU<>HPU sync happens here.
+        logger.info(f'decode token_ids: {token_ids}')
+        logger.info(f'decode positions: {positions}')
+        logger.info(f'decode logits_indices: {logits_indices}')
+        logger.info(f'decode block_list: {block_list}')
+        logger.info(f'decode block_usage: {block_usage}')
+        logger.info(f'decode block_groups: {block_groups}')
+        logger.info(
+            f'decode num_decode_tokens: {torch.sum(context_lens).item()}')
+        logger.info(f'decode slot_mapping: {slot_mapping}')
         return DecodeInputData(
             num_decodes=num_decodes,
             token_ids=token_ids.to(self.device),
             position_ids=positions.to(self.device),
-            logits_indices=logits_indices.to(self.device),         
+            logits_indices=logits_indices.to(self.device),
             attn_metadata=HPUAttentionMetadata.make_decode_metadata(
-                block_list=block_list_tensor,
-                block_usage=block_usage_tensor,
-                block_groups=block_groups_tensor,
+                block_list=block_list.to(self.device),
+                block_usage=block_usage.to(self.device),
+                block_groups=block_groups.to(self.device),
                 num_decode_tokens=torch.sum(context_lens).item(),
                 slot_mapping=slot_mapping.to(self.device),
             ))
@@ -981,32 +750,37 @@ class HPUModelRunner:
             self._prepare_prefill_inputs(num_scheduled_tokens),
             self._prepare_decode_inputs(num_decodes, scheduler_output),
         )
-    
-    def _execute_model_generic(self, token_ids, position_ids, attn_metadata, logits_indices):
+
+    def _execute_model_generic(self, token_ids, position_ids, attn_metadata,
+                               logits_indices):
         # FORWARD.
         trimmed_attn_metadata = trim_attn_metadata(attn_metadata)
         hidden_states = self.model.forward(input_ids=token_ids,
-                                                positions=position_ids,
-                                                attn_metadata=trimmed_attn_metadata,
-                                                kv_caches=self.kv_caches)
+                                           positions=position_ids,
+                                           attn_metadata=trimmed_attn_metadata,
+                                           kv_caches=self.kv_caches)
 
         #hidden_states = hidden_states[:num_scheduled_tokens]
         hidden_states = hidden_states[logits_indices]
         logits = self.model.compute_logits(hidden_states, None)
         return logits
 
-
-    def _execute_model_prefills(self, scheduler_output, prefill_data, prefill_start_idx, sampled_token_ids, logprobs, logprob_token_ids):
+    def _execute_model_prefills(self, scheduler_output, prefill_data,
+                                prefill_start_idx, sampled_token_ids, logprobs,
+                                logprob_token_ids):
         if len(list(prefill_data.zipped())) == 0:
-            logger.info(f"[ENGINE_ITER {self._ENGINE_ITER}] No prefills detected.")
+            logger.info(
+                f"[ENGINE_ITER {self._ENGINE_ITER}] No prefills detected.")
             return None, None
 
-        for idx, (req_id, prompt_len, token_ids, position_ids,
-                  attn_metadata, logits_indices) in enumerate(prefill_data.zipped()):
-            logits = self._execute_model_generic(token_ids, position_ids, attn_metadata, logits_indices)
+        for idx, (req_id, prompt_len, token_ids, position_ids, attn_metadata,
+                  logits_indices) in enumerate(prefill_data.zipped()):
+            logits = self._execute_model_generic(token_ids, position_ids,
+                                                 attn_metadata, logits_indices)
 
             # Sample the next token and get logprobs if needed.
-            sampling_metadata = self._prepare_sampling(scheduler_output, seq_idx=idx)
+            sampling_metadata = self._prepare_sampling(scheduler_output,
+                                                       seq_idx=idx)
             sampler_output = self.model.sample(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
@@ -1018,9 +792,12 @@ class HPUModelRunner:
             req_state = self.requests[req_id]
 
             if sampler_output.logprob_token_ids is not None:
-                logprob_token_ids[prefill_start_idx + idx] = sampler_output.logprob_token_ids.cpu()
+                logprob_token_ids[
+                    prefill_start_idx +
+                    idx] = sampler_output.logprob_token_ids.cpu()
             if sampler_output.logprobs is not None:
-                logprobs[prefill_start_idx + idx] = sampler_output.logprobs.cpu()
+                logprobs[prefill_start_idx +
+                         idx] = sampler_output.logprobs.cpu()
 
             # TODO: ASSERT NO PREFIX CACHING.
             assert req_state.num_computed_tokens == 0
@@ -1035,70 +812,93 @@ class HPUModelRunner:
             req_idx = self.input_batch.req_id_to_index[req_id]
             self.input_batch.token_ids_cpu[req_idx, seq_len] = token_id
             req_state.output_token_ids.append(token_id)
-            detokenized = self._tokenizer.decode(token_id) if token_id >= 0 and token_id <= len(self._tokenizer) else 'INVALID!!!'
-            logger.info(f"[ENGINE_ITER {self._ENGINE_ITER}] Prefill {idx} generated token id: {token_id} ({detokenized!r}).")
+            detokenized = self._tokenizer.decode(
+                token_id) if token_id >= 0 and token_id <= len(
+                    self._tokenizer) else 'INVALID!!!'
+            logger.info(
+                f"[ENGINE_ITER {self._ENGINE_ITER}] Prefill {idx} (req_id:{req_id}) generated token id: {token_id} ({detokenized!r})."
+            )
         return sampled_token_ids, logprobs, logprob_token_ids
 
-    def _execute_model_decode(self, scheduler_output, decode_data, sampled_token_ids, logprobs, logprob_token_ids):
-        pass
+    def _execute_model_decode(self, scheduler_output, decode_data,
+                              sampled_token_ids, logprobs, logprob_token_ids):
+        logger.info(
+            f"[ENGINE_ITER {self._ENGINE_ITER}] Executing decode on {decode_data.num_decodes} seqs..."
+        )
+        logits = self._execute_model_generic(decode_data.token_ids,
+                                             decode_data.position_ids,
+                                             decode_data.attn_metadata,
+                                             decode_data.logits_indices)
 
-    @torch.no_grad()
+        # Sample the next token and get logprobs if needed.
+        sampling_metadata = self._prepare_sampling(scheduler_output,
+                                                   decode_only=True)
+        sampler_output = self.model.sample(
+            logits=logits,
+            sampling_metadata=sampling_metadata,
+        )
+
+        # NOTE: TPU<>CPU sync happens here.
+        # We need to call .cpu() first to avoid recompilation.
+        token_ids = sampler_output.sampled_token_ids.cpu()[:decode_data.
+                                                           num_decodes]
+        sampled_token_ids_list = token_ids.tolist()
+        sampled_token_ids[:decode_data.num_decodes] = token_ids
+
+        # UPDATE REQUEST STATE.
+        for i, req_id in enumerate(
+                self.input_batch.req_ids[:decode_data.num_decodes]):
+            req_state = self.requests[req_id]
+
+            # TODO: ASSERT NO CHUNKED PREFILL.
+            assert scheduler_output.num_scheduled_tokens[req_id] == 1
+            seq_len = (req_state.num_computed_tokens +
+                       scheduler_output.num_scheduled_tokens[req_id])
+            assert seq_len == req_state.num_tokens
+
+            token_id = sampled_token_ids_list[i]
+            self.input_batch.token_ids_cpu[i, seq_len] = token_id
+            req_state.output_token_ids.append(token_id)
+            detokenized = self._tokenizer.decode(
+                token_id) if token_id >= 0 and token_id <= len(
+                    self._tokenizer) else 'INVALID!!!'
+            logger.info(
+                f"[ENGINE_ITER {self._ENGINE_ITER}] Decode {i} (req_id:{req_id}) generated token id: {token_id} ({detokenized!r})."
+            )
+        return sampled_token_ids, None, None
+
+    @torch.inference_mode()
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput:
         self._update_states(scheduler_output)
-        logger.info(f'[ENGINE_ITER {self._ENGINE_ITER}] Starting engine iteration with {self.input_batch.num_reqs} reqs...')
+        logger.info(
+            f'[ENGINE_ITER {self._ENGINE_ITER}] Starting engine iteration with {self.input_batch.num_reqs} reqs...'
+        )
         prefill_data, decode_data = self._prepare_inputs(scheduler_output)
         num_reqs = self.input_batch.num_reqs
         sampled_token_ids = torch.empty(num_reqs, dtype=torch.int32)
-        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        #FIXME(kzawora): Currently there's no handling of logprobs. Fix that later.
         logprob_token_ids = None
         logprobs = None
         ######################### DECODES #########################
         # Decodes run as one single batch with [padded_batch, 1]
         if decode_data.num_decodes > 0:
-            #sampled_token_ids, logprob_token_ids, logprobs = self._execute_model_decode(scheduler_output, decode_data, sampled_token_ids, None, None)
-            logger.info(f"[ENGINE_ITER {self._ENGINE_ITER}] Executing decode on {decode_data.num_decodes} seqs...")
-            logits = self._execute_model_generic(decode_data.token_ids, decode_data.position_ids, decode_data.attn_metadata, decode_data.logits_indices)
-            
-            # Sample the next token and get logprobs if needed.
-            sampling_metadata = self._prepare_sampling(scheduler_output, decode_only=True)
-            sampler_output = self.model.sample(
-                logits=logits,
-                sampling_metadata=sampling_metadata,
-            )
-
-            # NOTE: TPU<>CPU sync happens here.
-            # We need to call .cpu() first to avoid recompilation.
-            token_ids = sampler_output.sampled_token_ids.cpu()[:decode_data.num_decodes]
-            sampled_token_ids_list = token_ids.tolist()
-            sampled_token_ids[:decode_data.num_decodes] = token_ids
-
-            # UPDATE REQUEST STATE.
-            for i, req_id in enumerate(
-                    self.input_batch.req_ids[:decode_data.num_decodes]):
-                req_state = self.requests[req_id]
-
-                # TODO: ASSERT NO CHUNKED PREFILL.
-                assert scheduler_output.num_scheduled_tokens[req_id] == 1
-                seq_len = (req_state.num_computed_tokens +
-                           scheduler_output.num_scheduled_tokens[req_id])
-                assert seq_len == req_state.num_tokens
-
-                token_id = sampled_token_ids_list[i]
-                self.input_batch.token_ids_cpu[i, seq_len] = token_id
-                req_state.output_token_ids.append(token_id)
-                detokenized = self._tokenizer.decode(token_id) if token_id >= 0 and token_id <= len(self._tokenizer) else 'INVALID!!!'
-                logger.info(f"[ENGINE_ITER {self._ENGINE_ITER}] Decode {i} generated token id: {token_id} ({detokenized!r}).")
+            sampled_token_ids, logprob_token_ids, logprobs = self._execute_model_decode(
+                scheduler_output, decode_data, sampled_token_ids, logprobs,
+                logprob_token_ids)
 
         ######################### PREFILLS #########################
-        # Prefills run separately with shape [1, padded_prefill_len],
-        # due to lack of variable length attention kernel so far.
+        # Prefills run separately with shape [1, padded_prefill_len]
         if num_reqs - decode_data.num_decodes > 0:
-            logger.info(f"[ENGINE_ITER {self._ENGINE_ITER}] Executing prefill on {num_reqs - decode_data.num_decodes} seqs...")
-            sampled_token_ids, logprob_token_ids, logprobs = self._execute_model_prefills(scheduler_output, prefill_data,decode_data.num_decodes, sampled_token_ids, None, None)
-        
+            logger.info(
+                f"[ENGINE_ITER {self._ENGINE_ITER}] Executing prefill on {num_reqs - decode_data.num_decodes} seqs..."
+            )
+            sampled_token_ids, logprob_token_ids, logprobs = self._execute_model_prefills(
+                scheduler_output, prefill_data, decode_data.num_decodes,
+                sampled_token_ids, logprobs, logprob_token_ids)
+
         model_runner_output = ModelRunnerOutput(
             req_ids=self.input_batch.req_ids[:num_reqs],
             req_id_to_index=self.input_batch.req_id_to_index,
@@ -1106,16 +906,25 @@ class HPUModelRunner:
             logprob_token_ids_cpu=logprob_token_ids,
             logprobs_cpu=logprobs,
         )
-        import pdb; pdb.set_trace()
-        logger.info(f'[ENGINE_ITER {self._ENGINE_ITER}] Engine iteration done!')
+        import pdb
+        pdb.set_trace()
+        logger.info(
+            f'[ENGINE_ITER {self._ENGINE_ITER}] Engine iteration done!')
         if False:
             for i in range(num_reqs):
                 req_id = self.input_batch.req_ids[i]
                 req_idx = self.input_batch.req_id_to_index[req_id]
                 token_ids = self.input_batch.token_ids_cpu[req_idx]
-                prompt = self._tokenizer.decode(token_ids[:self.input_batch.num_prompt_tokens_cpu[req_idx]])
-                generated = self._tokenizer.decode(token_ids[self.input_batch.num_prompt_tokens_cpu[req_idx]:max(self.input_batch.num_prompt_tokens_cpu[req_idx],self.input_batch.num_computed_tokens_cpu[req_idx])])
-                logger.info(f'[ENGINE_ITER {self._ENGINE_ITER}] REQ:{req_id} IDX:{req_idx} generated token: {self._tokenizer.decode(sampled_token_ids[req_idx])!r}, all generated so far: {generated!r}')
+                prompt = self._tokenizer.decode(
+                    token_ids[:self.input_batch.
+                              num_prompt_tokens_cpu[req_idx]])
+                generated = self._tokenizer.decode(token_ids[
+                    self.input_batch.num_prompt_tokens_cpu[req_idx]:max(
+                        self.input_batch.num_prompt_tokens_cpu[req_idx], self.
+                        input_batch.num_computed_tokens_cpu[req_idx])])
+                logger.info(
+                    f'[ENGINE_ITER {self._ENGINE_ITER}] REQ:{req_id} IDX:{req_idx} generated token: {self._tokenizer.decode(sampled_token_ids[req_idx])!r}, all generated so far: {generated!r}'
+                )
         self._ENGINE_ITER += 1
         return model_runner_output
 
@@ -1484,28 +1293,34 @@ class InputBatch:
             last_req_index -= 1
 
     def make_sampling_metadata(
-        self,
-        skip_copy: bool = False,
-        prefill_only : bool = False,
-        decode_only : bool = False,
-        seq_idx : Optional[int] = None 
-    ) -> SamplingMetadata:
+            self,
+            skip_copy: bool = False,
+            prefill_only: bool = False,
+            decode_only: bool = False,
+            seq_idx: Optional[int] = None) -> SamplingMetadata:
         start_seq = 0
         end_seq = self.num_reqs
         if prefill_only:
             start_seq = self.num_decodes
-            assert not (decode_only or seq_idx), "make_sampling_metadata can be either prefill_only, decode_only, seq_idx, or neither."
+            assert not (
+                decode_only or seq_idx
+            ), "make_sampling_metadata can be either prefill_only, decode_only, seq_idx, or neither."
         elif decode_only:
             end_seq = self.num_decodes
-            assert not (prefill_only or seq_idx), "make_sampling_metadata can be either prefill_only, decode_only, seq_idx, or neither."
+            assert not (
+                prefill_only or seq_idx
+            ), "make_sampling_metadata can be either prefill_only, decode_only, seq_idx, or neither."
         elif seq_idx is not None:
             start_seq = seq_idx
             end_seq = seq_idx + 1
-            assert not (prefill_only or decode_only), "make_sampling_metadata can be either prefill_only, decode_only, seq_idx, or neither."
+            assert not (
+                prefill_only or decode_only
+            ), "make_sampling_metadata can be either prefill_only, decode_only, seq_idx, or neither."
 
         if not skip_copy:
             self.temperature[start_seq:end_seq].copy_(
-                self.temperature_cpu_tensor[start_seq:end_seq], non_blocking=True)
+                self.temperature_cpu_tensor[start_seq:end_seq],
+                non_blocking=True)
             self.top_p[start_seq:end_seq].copy_(
                 self.top_p_cpu_tensor[start_seq:end_seq], non_blocking=True)
             self.top_k[start_seq:end_seq].copy_(

@@ -72,7 +72,7 @@ class HPUAttentionMetadata(HPUPagedAttentionMetadata, AttentionMetadata):
     # or all decoding. True if all sequences are prompts.
     is_prompt: bool
     attn_bias: Optional[torch.Tensor]
-    
+
     # NOTE(sang): Definition of context_len, query_len, and seq_len.
     # |---------- N-1 iteration --------|
     # |---------------- N iteration ---------------------|
@@ -82,44 +82,46 @@ class HPUAttentionMetadata(HPUPagedAttentionMetadata, AttentionMetadata):
     #                                   |-- query_len ---|
     seq_lens_tensor: Optional[torch.Tensor]
     context_lens_tensor: Optional[torch.Tensor]
-    
-    @classmethod
-    def make_prefill_metadata(cls, seq_lens_tensor, num_prefills, num_prefill_tokens, slot_mapping):
-        return cls(is_prompt=True,    
-                   block_list=None,                 
-                   block_mapping=None,
-                    block_usage=None,
-                    block_indices=None,
-                    block_offsets=None,
-                    block_scales=None,
-                    block_groups=None,
-                    attn_bias=None,
-                    num_decode_tokens=0,
-                    context_lens_tensor=None,
-                    multi_modal_placeholder_index_maps=None,
-                    seq_lens_tensor=seq_lens_tensor,
-                    num_prefills=num_prefills,
-                    num_prefill_tokens=num_prefill_tokens,
-                    slot_mapping=slot_mapping)
 
     @classmethod
-    def make_decode_metadata(cls, block_list, block_usage, block_groups, num_decode_tokens, slot_mapping):
+    def make_prefill_metadata(cls, seq_lens_tensor, num_prefills,
+                              num_prefill_tokens, slot_mapping):
+        return cls(is_prompt=True,
+                   block_list=None,
+                   block_mapping=None,
+                   block_usage=None,
+                   block_indices=None,
+                   block_offsets=None,
+                   block_scales=None,
+                   block_groups=None,
+                   attn_bias=None,
+                   num_decode_tokens=0,
+                   context_lens_tensor=None,
+                   multi_modal_placeholder_index_maps=None,
+                   seq_lens_tensor=seq_lens_tensor,
+                   num_prefills=num_prefills,
+                   num_prefill_tokens=num_prefill_tokens,
+                   slot_mapping=slot_mapping)
+
+    @classmethod
+    def make_decode_metadata(cls, block_list, block_usage, block_groups,
+                             num_decode_tokens, slot_mapping):
         return cls(is_prompt=False,
-            block_mapping=None,
-            block_indices=None,
-            block_offsets=None,
-            block_scales=None,
-            attn_bias=None,
-            seq_lens_tensor=None,
-            context_lens_tensor=None,
-            num_prefills=0,
-            num_prefill_tokens=0,
-            multi_modal_placeholder_index_maps=None,
-            block_list=block_list,
-            block_usage=block_usage,
-            block_groups=block_groups,
-            num_decode_tokens=num_decode_tokens,
-            slot_mapping=slot_mapping)
+                   block_mapping=None,
+                   block_indices=None,
+                   block_offsets=None,
+                   block_scales=None,
+                   attn_bias=None,
+                   seq_lens_tensor=None,
+                   context_lens_tensor=None,
+                   num_prefills=0,
+                   num_prefill_tokens=0,
+                   multi_modal_placeholder_index_maps=None,
+                   block_list=block_list,
+                   block_usage=block_usage,
+                   block_groups=block_groups,
+                   num_decode_tokens=num_decode_tokens,
+                   slot_mapping=slot_mapping)
 
 
 class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
