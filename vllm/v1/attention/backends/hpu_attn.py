@@ -82,6 +82,44 @@ class HPUAttentionMetadata(HPUPagedAttentionMetadata, AttentionMetadata):
     #                                   |-- query_len ---|
     seq_lens_tensor: Optional[torch.Tensor]
     context_lens_tensor: Optional[torch.Tensor]
+    
+    @classmethod
+    def make_prefill_metadata(cls, seq_lens_tensor, num_prefills, num_prefill_tokens, slot_mapping):
+        return cls(is_prompt=True,    
+                   block_list=None,                 
+                   block_mapping=None,
+                    block_usage=None,
+                    block_indices=None,
+                    block_offsets=None,
+                    block_scales=None,
+                    block_groups=None,
+                    attn_bias=None,
+                    num_decode_tokens=0,
+                    context_lens_tensor=None,
+                    multi_modal_placeholder_index_maps=None,
+                    seq_lens_tensor=seq_lens_tensor,
+                    num_prefills=num_prefills,
+                    num_prefill_tokens=num_prefill_tokens,
+                    slot_mapping=slot_mapping)
+
+    @classmethod
+    def make_decode_metadata(cls, block_list, block_usage, block_groups, num_decode_tokens, slot_mapping):
+        return cls(is_prompt=False,
+            block_mapping=None,
+            block_indices=None,
+            block_offsets=None,
+            block_scales=None,
+            attn_bias=None,
+            seq_lens_tensor=None,
+            context_lens_tensor=None,
+            num_prefills=0,
+            num_prefill_tokens=0,
+            multi_modal_placeholder_index_maps=None,
+            block_list=block_list,
+            block_usage=block_usage,
+            block_groups=block_groups,
+            num_decode_tokens=num_decode_tokens,
+            slot_mapping=slot_mapping)
 
 
 class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
@@ -121,6 +159,8 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
         self.matmul_qk = Matmul()
         self.softmax = Softmax()
         self.matmul_av = Matmul()
+        self.batch2block_matmul = Matmul()
+        self.block2batch_matmul = Matmul()
         self.k_cache = VLLMKVCache()
         self.v_cache = VLLMKVCache()
         self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
@@ -259,6 +299,8 @@ class HPUAttentionImpl(AttentionImpl, torch.nn.Module):
                 scale=self.scale,
                 matmul_qk_op=self.matmul_qk,
                 matmul_av_op=self.matmul_av,
+                batch2block_matmul_op=self.batch2block_matmul,
+                block2batch_matmul_op=self.block2batch_matmul,
                 keys_fetch_func=self.k_cache.fetch_from_cache,
                 values_fetch_func=self.v_cache.fetch_from_cache)
         # Reshape the output tensor.

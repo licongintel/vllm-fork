@@ -27,6 +27,10 @@ class Scheduler:
         cache_config: CacheConfig,
         lora_config: Optional[LoRAConfig],
     ) -> None:
+        # TODO: properly handle for HPU.
+        cache_config.enable_prefix_caching = False
+        scheduler_config.chunked_prefill_enabled = False
+
         self.scheduler_config = scheduler_config
         self.cache_config = cache_config
         self.lora_config = lora_config
@@ -201,6 +205,12 @@ class Scheduler:
                     num_computed_tokens -= 1
                     num_new_tokens = 1
                     computed_blocks.pop()
+
+                # If chunked prefill is not enabled, breakout of the loop.
+                if (not self.scheduler_config.chunked_prefill_enabled
+                        and num_new_tokens > token_budget):
+                    break
+
                 num_new_tokens = min(num_new_tokens, token_budget)
                 assert num_new_tokens > 0
 
@@ -219,20 +229,8 @@ class Scheduler:
                     # The request cannot be scheduled.
                     break
                 request.num_computed_tokens = num_computed_tokens
-                
-                self.waiting.popleft()
-                if self.disable_prefill_chunking:
-                    # Prevent prefill chunking in WAITING queue
-                    running_all_decode = all(req.num_output_tokens > 0 for req in self.running) 
-                    request_is_decode = request.num_output_tokens > 0
-                    is_queue_decode = running_all_decode and request_is_decode
-                    running_all_prefill = all(req.num_output_tokens == 0 for req in self.running)
-                    request_is_prefill = request.num_output_tokens == 0
-                    is_queue_prefill = running_all_prefill and request_is_prefill
-                    import pdb; pdb.set_trace()
-                    if not is_queue_prefill and not is_queue_decode:
-                        break
 
+                self.waiting.popleft()
                 self.running.append(request)
                 if request.status == RequestStatus.WAITING:
                     scheduled_new_reqs.append(request)
@@ -527,7 +525,7 @@ class NewRequestData:
     sampling_params: SamplingParams
     block_ids: List[int]
     num_computed_tokens: int
-    num_output_tokens : int = 0
+    num_output_tokens: int = 0
 
     @classmethod
     def from_request(
@@ -536,17 +534,15 @@ class NewRequestData:
         block_ids: List[int],
         num_computed_tokens: int,
     ) -> "NewRequestData":
-        return cls(
-            req_id=request.request_id,
-            prompt_token_ids=request.prompt_token_ids,
-            prompt=request.prompt,
-            mm_inputs=request.mm_inputs,
-            mm_positions=request.mm_positions,
-            sampling_params=request.sampling_params,
-            block_ids=block_ids,
-            num_computed_tokens=num_computed_tokens,
-            num_output_tokens=request.num_output_tokens
-        )
+        return cls(req_id=request.request_id,
+                   prompt_token_ids=request.prompt_token_ids,
+                   prompt=request.prompt,
+                   mm_inputs=request.mm_inputs,
+                   mm_positions=request.mm_positions,
+                   sampling_params=request.sampling_params,
+                   block_ids=block_ids,
+                   num_computed_tokens=num_computed_tokens,
+                   num_output_tokens=request.num_output_tokens)
 
 
 @dataclass
@@ -564,12 +560,10 @@ class ResumedRequestData:
         block_ids: List[int],
         num_computed_tokens: int,
     ) -> "ResumedRequestData":
-        return cls(
-            req_id=request.request_id,
-            block_ids=block_ids,
-            num_computed_tokens=num_computed_tokens,
-            num_output_tokens=request.num_output_tokens
-        )
+        return cls(req_id=request.request_id,
+                   block_ids=block_ids,
+                   num_computed_tokens=num_computed_tokens,
+                   num_output_tokens=request.num_output_tokens)
 
 
 @dataclass
@@ -587,12 +581,10 @@ class RunningRequestData:
         new_block_ids: List[int],
         num_computed_tokens: int,
     ) -> "RunningRequestData":
-        return cls(
-            req_id=request.request_id,
-            new_block_ids=new_block_ids,
-            num_computed_tokens=num_computed_tokens,
-            num_output_tokens=request.num_output_tokens
-        )
+        return cls(req_id=request.request_id,
+                   new_block_ids=new_block_ids,
+                   num_computed_tokens=num_computed_tokens,
+                   num_output_tokens=request.num_output_tokens)
 
 
 @dataclass

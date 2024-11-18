@@ -29,11 +29,10 @@ class HPUExecutor:
         self.worker.load_model()
 
     def _create_worker(
-        self,
-        local_rank: int = 0,
-        rank: int = 0,
-        distributed_init_method: Optional[str] = None
-    ) -> HPUWorker:
+            self,
+            local_rank: int = 0,
+            rank: int = 0,
+            distributed_init_method: Optional[str] = None) -> HPUWorker:
         """Return worker init args for a given rank."""
 
         if distributed_init_method is None:

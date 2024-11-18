@@ -86,7 +86,9 @@ class HPUWorker:
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
         if is_fake_hpu():
-            cache_block_size = _get_cache_block_size(self.cache_config, self.model_config, self.parallel_config)
+            cache_block_size = _get_cache_block_size(self.cache_config,
+                                                     self.model_config,
+                                                     self.parallel_config)
             fake_hpu_cache_alloc = 4 * 2**30  # take 4 GiB flat on fake hpu
             return fake_hpu_cache_alloc // cache_block_size, 0
         with HabanaMemoryProfiler() as m:
@@ -99,7 +101,9 @@ class HPUWorker:
         # recipes we will use the extra memory for graphs/blocks
         free_hpu_memory = torch.hpu.mem_get_info()[0]
 
-        cache_block_size = _get_cache_block_size(self.cache_config, self.model_config, self.parallel_config)
+        cache_block_size = _get_cache_block_size(self.cache_config,
+                                                 self.model_config,
+                                                 self.parallel_config)
         graph_reserved_mem = (float(
             os.environ.get('VLLM_GRAPH_RESERVED_MEM', '0.1'))
                               if not self.model_config.enforce_eager else 0)
@@ -124,7 +128,6 @@ class HPUWorker:
 
         gc.collect()
         return num_hpu_blocks, 0
-
 
     def initialize_cache(self, num_gpu_blocks: int) -> None:
         """Allocate GPU and CPU KV cache with the specified number of blocks."""
@@ -169,12 +172,14 @@ def init_worker_distributed_environment(
     local_rank: int = -1,
 ) -> None:
     """Initialize the distributed environment."""
-    init_distributed_environment(parallel_config.world_size, rank,
-                                 distributed_init_method, local_rank, backend='hccl')
+    init_distributed_environment(parallel_config.world_size,
+                                 rank,
+                                 distributed_init_method,
+                                 local_rank,
+                                 backend='hccl')
 
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
                                       parallel_config.pipeline_parallel_size)
-
 
 
 def _get_cache_block_size(

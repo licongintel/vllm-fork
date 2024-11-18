@@ -12,15 +12,12 @@ import torch.distributed
 import torch.nn as nn
 
 from vllm import envs
-from vllm.compilation.compile_context import set_compile_context
-from vllm.compilation.config import CompilationConfig
-from vllm.compilation.levels import CompilationLevel
 from vllm.config import VllmConfig
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 from vllm.multimodal import MultiModalDataDict
-from vllm.plugins import set_compilation_config
+from vllm.multimodal.inputs import MultiModalKwargs, PlaceholderRange
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, cdiv, is_fake_hpu,
                         is_pin_memory_available, make_tensor_with_pad)
@@ -29,6 +26,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm_hpu_extension.profiler import (HabanaHighLevelProfiler,
                                          HabanaMemoryProfiler, format_bytes)
+from vllm_hpu_extension.ops import batch2block, block2batch
 import habana_frameworks.torch as htorch
 if TYPE_CHECKING:
     from vllm.v1.core.scheduler import SchedulerOutput
@@ -40,6 +38,51 @@ _TYPE_CACHE = {}
 # Use caution when updating them!
 _PAD_SLOT_ID = 0
 _PAD_BLOCK_ID = 0
+
+
+@dataclass
+class PrefillInputData:
+
+    request_ids: List
+    prompt_lens: List
+    token_ids: List
+    position_ids: List
+    attn_metadata: List
+    logits_indices: List
+
+    def zipped(self):
+        return zip(self.request_ids, self.prompt_lens, self.token_ids,
+                   self.position_ids, self.attn_metadata, self.logits_indices)
+
+
+@dataclass
+class DecodeInputData:
+
+    num_decodes: int
+    token_ids: Optional[torch.Tensor] = None
+    position_ids: Optional[torch.Tensor] = None
+    attn_metadata: HPUAttentionMetadata = None
+    logits_indices: Optional[torch.Tensor] = None
+
+
+def _get_padded_batch_size(batch_size: int) -> int:
+    # The GMM Pallas kernel requires num_tokens * topk to be a multiple of 16.
+    # To meet this requirement in the simplest way, we set the minimal batch
+    # size to 8.
+    if batch_size <= 8:
+        return 8
+    else:
+        return ((batch_size + 15) // 16) * 16
+
+
+def _get_padded_prefill_len(x: int) -> int:
+    # NOTE(woosuk): The pallas FlashAttention kernel requires the sequence
+    # length to be a multiple of 16. We pad the prompt length to the nearest
+    # multiple of 16. This is also good for performance.
+    if x <= 16:
+        return 16
+    return 1 << (x - 1).bit_length()
+
 
 class HpuModelAdapter:
 
@@ -105,32 +148,59 @@ class HpuModelAdapter:
             mask, -math.inf))
 
         if not is_fake_hpu() and htorch.utils.internal.is_lazy():
-            block_mapping = torch.nn.functional.one_hot(metadata.block_mapping,
+            block_mapping = torch.nn.functional.one_hot(metadata.block_groups,
                                                         num_classes=batch_size)
         else:
             # Unfortunately one_hot on CPU/torch.compile mode/eager mode
-            # doesn't handle out of bounds classes,
-            # so we convert all negative values to 0.
-            block_mapping = torch.nn.functional.relu(metadata.block_mapping)
+            # doesn't handle out of bounds classes so we need to convert
+            # all negative values to 0 (block_mapping) or bs (block_groups)
+            block_groups = metadata.block_groups.to(torch.long)
+            block_mapping = torch.nn.functional.relu(block_groups)
             block_mapping = torch.nn.functional.one_hot(block_mapping,
                                                         num_classes=batch_size)
-            oob_values = metadata.block_mapping.lt(0)
+            oob_values = block_groups.lt(0)
             block_mapping.masked_fill_(oob_values.unsqueeze(-1), 0)
+            block_groups.masked_fill_(oob_values, batch_size)
+            metadata = metadata._replace(block_groups=block_groups)
         block_mapping = block_mapping.to(dtype)
         metadata = metadata._replace(block_mapping=block_mapping,
                                      attn_bias=attn_bias)
         return metadata
 
+    def _set_block_scales(self, metadata, device):
+        block_mapping = metadata.block_mapping
+        ones = torch.ones((block_mapping.size(0), ),
+                          device=device,
+                          dtype=block_mapping.dtype)
+        sums = batch2block(block2batch(ones, block_mapping), block_mapping)
+        block_scales = torch.reciprocal(torch.maximum(ones, sums))
+        metadata = metadata._replace(block_scales=block_scales)
+        return metadata
+
+    def _set_indices_and_offsets(self, metadata, block_size, is_prompt):
+        slot_mapping = metadata.slot_mapping.flatten()
+        indices = torch.div(slot_mapping, block_size, rounding_mode="floor")
+        if is_prompt:
+            indices = indices.unflatten(0, (-1, block_size))[:, 0]
+            offsets = None
+        else:
+            offsets = torch.fmod(slot_mapping, block_size)
+        metadata = metadata._replace(block_offsets=offsets,
+                                     block_indices=indices)
+        return metadata
+
     def _update_metadata(self, attn_metadata, batch_size, seq_len, device,
                          dtype):
         if attn_metadata.is_prompt:
-            meta = attn_metadata
-            attn_metadata = self._set_attn_bias(meta, batch_size, seq_len,
-                                                device, dtype)
+            attn_metadata = self._set_attn_bias(attn_metadata, batch_size,
+                                                seq_len, device, dtype)
         else:
-            meta = attn_metadata
-            attn_metadata = self._set_block_mapping(meta, batch_size, device,
-                                                    dtype)
+            attn_metadata = self._set_block_mapping(attn_metadata, batch_size,
+                                                    device, dtype)
+            attn_metadata = self._set_block_scales(attn_metadata, device)
+        attn_metadata = self._set_indices_and_offsets(attn_metadata,
+                                                      self.block_size,
+                                                      attn_metadata.is_prompt)
         return attn_metadata
 
     def forward(self, *args, **kwargs):
@@ -149,16 +219,22 @@ class HpuModelAdapter:
     def sample(self, *args, **kwargs):
         return self.model.sample(*args, **kwargs)
 
+    def generate_proposals(self, *args, **kwargs):
+        return self.model.generate_proposals(*args, **kwargs)
+
     # sampler property will be used by spec_decode_worker
     # don't rename
     @property
     def sampler(self):
         return self.model.sampler
 
+
 def _maybe_wrap_in_hpu_graph(*args, **kwargs):
     return htorch.hpu.wrap_in_hpu_graph(
         HpuModelAdapter(*args, **kwargs), disable_tensor_cache=True
-    ) if False and htorch.utils.internal.is_lazy() else HpuModelAdapter(*args, **kwargs)
+    ) if False and htorch.utils.internal.is_lazy() else HpuModelAdapter(
+        *args, **kwargs)
+
 
 def subtuple(obj: object,
              typename: str,
@@ -177,6 +253,7 @@ def subtuple(obj: object,
         _TYPE_CACHE[typename] = collections.namedtuple(typename,
                                                        ' '.join(fields))
     return _TYPE_CACHE[typename](**values)
+
 
 def trim_attn_metadata(metadata: HPUAttentionMetadata) -> object:
     # NOTE(kzawora): To anyone working on this in the future:
@@ -200,12 +277,12 @@ def trim_attn_metadata(metadata: HPUAttentionMetadata) -> object:
     # input_hash(123) != input_hash(321)
     # input_hash("abc") != input_hash("cba")
     attention_metadata = subtuple(metadata, 'TrimmedAttentionMetadata', [
-        'attn_bias', 'seq_lens_tensor', 'context_lens_tensor',
-        'block_list', 'block_mapping', 'block_usage', 'slot_mapping',
-        'is_prompt', 'block_indices', 'block_offsets', 'block_scales',
-        'block_groups'
+        'attn_bias', 'seq_lens_tensor', 'context_lens_tensor', 'block_list',
+        'block_mapping', 'block_usage', 'slot_mapping', 'is_prompt',
+        'block_indices', 'block_offsets', 'block_scales', 'block_groups'
     ])
     return attention_metadata
+
 
 def next_pow2(value: int, base: int):
     res = base
@@ -217,6 +294,7 @@ def next_pow2(value: int, base: int):
 
 def round_up(value: int, k: int):
     return (value + k - 1) // k * k
+
 
 def pad_list(list, k, v):
     target_len = round_up(len(list), k)
@@ -241,6 +319,8 @@ class HPUModelRunner:
         self,
         vllm_config: VllmConfig,
     ):
+        #TODO(kzawora): remove this, this is ugly and only used for diagnostics
+        self._ENGINE_ITER = 0
         # TODO: use ModelRunnerBase.__init__(self, vllm_config=vllm_config)
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -294,18 +374,22 @@ class HPUModelRunner:
             pin_memory=self.pin_memory,
         )
 
-        self.use_cuda_graph = (envs.VLLM_TORCH_COMPILE_LEVEL
-                               == CompilationLevel.PIECEWISE
-                               and not self.model_config.enforce_eager)
+        self.use_hpu_graph = not self.model_config.enforce_eager
         # TODO(woosuk): Provide an option to tune the max cudagraph batch size.
         self.cudagraph_batch_sizes = [1, 2, 4] + [i for i in range(8, 513, 8)]
-        self.max_batch_size = 256 # TODO(kzawora): fix this garbage 
-        self.input_ids = torch.zeros((self.max_batch_size, self.max_num_tokens),
-                                     dtype=torch.int32,
-                                     device=self.device)
-        self.positions = torch.zeros((self.max_batch_size, self.max_num_tokens),
-                                     dtype=torch.int64,
-                                     device=self.device)
+        self.max_batch_size = 256  # TODO(kzawora): fix this garbage
+        self.input_ids = torch.zeros(
+            (self.max_batch_size, self.max_num_tokens),
+            dtype=torch.int32,
+            device=self.device)
+        self.positions = torch.zeros(
+            (self.max_batch_size, self.max_num_tokens),
+            dtype=torch.int64,
+            device=self.device)
+        self.prefill_positions = torch.tensor(
+            range(self.max_model_len),
+            device="cpu",
+        ).to(torch.int32).reshape(1, -1)
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         # Remove stopped requests from the cached states.
@@ -360,13 +444,13 @@ class HPUModelRunner:
                 req_id=req_id,
                 prompt_token_ids=req_data.prompt_token_ids,
                 prompt=req_data.prompt,
-                multi_modal_data=req_data.multi_modal_data,
+                mm_inputs=req_data.mm_inputs,
+                mm_positions=req_data.mm_positions,
                 sampling_params=sampling_params,
                 generator=generator,
                 block_ids=req_data.block_ids,
                 num_computed_tokens=req_data.num_computed_tokens,
                 output_token_ids=[],
-                num_output_tokens=0 # NOTE(kzawora): this assumes that all new requests contain no output tokens out of the box 
             )
             req_ids_to_add.append(req_id)
 
@@ -379,24 +463,21 @@ class HPUModelRunner:
             req_state.num_computed_tokens = req_data.num_computed_tokens
             req_ids_to_add.append(req_id)
 
-        # Add the new or resumed requests to the persistent batch.
-        # The smaller empty indices are filled first.
-        removed_req_indices = sorted(removed_req_indices, reverse=True)
-        for req_id in req_ids_to_add:
-            req_state = self.requests[req_id]
-            if removed_req_indices:
-                # Fill the empty index.
-                req_index = removed_req_indices.pop()
-            else:
-                # Append to the end.
-                req_index = None
-            self.input_batch.add_request(req_state, req_index)
-
+        # THIS MOVES ALL THE DECODES TO THE FIRST N IN BATCH.
         # Condense the batched states if there are empty indices.
+        removed_req_indices = sorted(removed_req_indices, reverse=True)
         if removed_req_indices:
             self.input_batch.condense(removed_req_indices)
-
-    def _prepare_inputs(self, scheduler_output: "SchedulerOutput"):
+        
+        # ALL THE PREFILLS ARE THE LAST M IN THE BATCH.
+        # These are added at the end after the bacth is condensed.
+        self.input_batch.num_prefills = len(req_ids_to_add)
+        for req_id in req_ids_to_add:
+            req_state = self.requests[req_id]
+            self.input_batch.add_request(req_state, None)
+            
+    
+    def _prepare_inputs_old(self, scheduler_output: "SchedulerOutput"):
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
@@ -404,8 +485,8 @@ class HPUModelRunner:
         assert not self.input_batch.mixed_batch, "Prefill chunking is not supported on HPU"
         is_prompt = self.input_batch.all_prefill
         is_decode = self.input_batch.all_decode
-        num_prefills = num_reqs if is_prompt else 0 
-        num_decodes = num_reqs if is_decode else 0 
+        num_prefills = num_reqs if is_prompt else 0
+        num_decodes = num_reqs if is_decode else 0
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
@@ -425,38 +506,45 @@ class HPUModelRunner:
         num_scheduled_tokens = np.array(num_scheduled_tokens, dtype=np.int32)
         assert max_num_scheduled_tokens > 0
 
-        # NOTE(kzawora): In prefills, when prefix caching is enabled (on by 
-        # default), num_computed_tokens_cpu might be non-zero even for first 
-        # batch. This is a new behavior in V1 - KVs can be cached even within 
+        # NOTE(kzawora): In prefills, when prefix caching is enabled (on by
+        # default), num_computed_tokens_cpu might be non-zero even for first
+        # batch. This is a new behavior in V1 - KVs can be cached even within
         # the same iteration
         seq_lens = (self.input_batch.num_computed_tokens_cpu[:num_reqs] +
                     num_scheduled_tokens)
         context_lens = self.input_batch.num_computed_tokens_cpu[:num_reqs]
         max_seq_len = seq_lens.max()
-        num_blocks = math.ceil(max_seq_len / self.block_size) # NOTE(kzawora): it seems like block table is overallocated by 1, but I don't know why. Maybe add +1 here
+        num_blocks = math.ceil(
+            max_seq_len / self.block_size
+        )  # NOTE(kzawora): it seems like block table is overallocated by 1, but I don't know why. Maybe add +1 here
         max_blocked_seq_len = num_blocks * self.block_size
-
 
         # Get batched arange.
         # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-        arange_matrix = np.tile(np.arange(max_blocked_seq_len),
-                                (num_reqs, 1))
+        arange_matrix = np.tile(np.arange(max_blocked_seq_len), (num_reqs, 1))
         mask = arange_matrix < num_scheduled_tokens[:, np.newaxis]
         arange_matrix[~mask] = 0
-        
 
         # Calculate the slot mapping.
-        block_table = self.input_batch.block_table_cpu_tensor[:num_reqs,:num_blocks]
+        block_table = self.input_batch.block_table_cpu_tensor[:num_reqs, :
+                                                              num_blocks]
         block_table_list = block_table.tolist()
-        slot_mapping = torch.add(torch.repeat_interleave(torch.mul(block_table, self.block_size), self.block_size, dim=1), torch.from_numpy(arange_matrix))
+        slot_mapping = torch.add(
+            torch.repeat_interleave(torch.mul(block_table, self.block_size),
+                                    self.block_size,
+                                    dim=1), torch.from_numpy(arange_matrix))
         slot_mapping.masked_fill_(torch.from_numpy(~mask), 0)
         slot_mapping_list = slot_mapping.tolist()
 
         # NOTE(kzawora): this is probably dumb
-        input_ids = self.input_batch.token_ids_cpu[:num_reqs,:max_blocked_seq_len]
-        positions = [list(range(context_len, seq_len)) for context_len, seq_len in zip(context_lens,seq_lens)] # idk what to do here
-        self.input_ids[:num_reqs,:max_blocked_seq_len].copy_(torch.from_numpy(input_ids),     
-                              non_blocking=True)
+        input_ids = self.input_batch.token_ids_cpu[:num_reqs, :
+                                                   max_blocked_seq_len]
+        positions = [
+            list(range(context_len, seq_len))
+            for context_len, seq_len in zip(context_lens, seq_lens)
+        ]  # idk what to do here
+        self.input_ids[:num_reqs, :max_blocked_seq_len].copy_(
+            torch.from_numpy(input_ids), non_blocking=True)
 
         query_start_loc = torch.empty((num_reqs + 1, ),
                                       dtype=torch.int32,
@@ -465,34 +553,37 @@ class HPUModelRunner:
         query_start_loc_np = query_start_loc.numpy()
         query_start_loc_np[0] = 0
         np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1:])
-        
+
         positions = make_tensor_with_pad(positions,
-                                        max_len=max_blocked_seq_len,
-                                        pad=0,
-                                        dtype=torch.long,
-                                        device=self.device)
-        self.positions[:num_reqs,:max_blocked_seq_len].copy_(positions,
-                                                     non_blocking=True)
+                                         max_len=max_blocked_seq_len,
+                                         pad=0,
+                                         dtype=torch.long,
+                                         device=self.device)
+        self.positions[:num_reqs, :max_blocked_seq_len].copy_(
+            positions, non_blocking=True)
         seq_lens_tensor = torch.empty((num_reqs, ),
-                                dtype=torch.int32,
-                                device="cpu",
-                                pin_memory=self.pin_memory)
+                                      dtype=torch.int32,
+                                      device="cpu",
+                                      pin_memory=self.pin_memory)
         context_lens_tensor = torch.empty((num_reqs, ),
-                                dtype=torch.int32,
-                                device="cpu",
-                                pin_memory=self.pin_memory)
+                                          dtype=torch.int32,
+                                          device="cpu",
+                                          pin_memory=self.pin_memory)
         seq_lens_tensor[:num_reqs].copy_(torch.from_numpy(seq_lens),
-                                                          non_blocking=True)
+                                         non_blocking=True)
         context_lens_tensor[:num_reqs].copy_(torch.from_numpy(context_lens),
-                                                          non_blocking=True)
+                                             non_blocking=True)
         query_start_loc = query_start_loc.to(self.device, non_blocking=True)
         slot_mapping = slot_mapping.to(self.device, non_blocking=True).long()
         seq_lens_tensor = seq_lens_tensor.to(self.device, non_blocking=True)
-        context_lens_tensor = context_lens_tensor.to(self.device, non_blocking=True)
+        context_lens_tensor = context_lens_tensor.to(self.device,
+                                                     non_blocking=True)
         block_list, block_mapping, block_groups, block_usage, block_scales = None, None, None, None, None
-        block_indices, block_offsets = precompute_indices_and_offsets(self.block_size, slot_mapping, is_prompt)
+        block_indices, block_offsets = precompute_indices_and_offsets(
+            self.block_size, slot_mapping, is_prompt)
         if not is_prompt:
-            block_list, block_mapping, block_groups, block_usage, block_scales = self.get_habana_paged_attn_buffers(block_table_list, slot_mapping_list)
+            block_list, block_mapping, block_groups, block_usage, block_scales = self.get_habana_paged_attn_buffers(
+                block_table_list, slot_mapping_list)
         attn_metadata = HPUAttentionMetadata(
             is_prompt=is_prompt,
             block_list=block_list,
@@ -503,13 +594,14 @@ class HPUModelRunner:
             block_scales=block_scales,
             block_groups=block_groups,
             attn_bias=None,
-            seq_lens_tensor=seq_lens_tensor, # FIXME(kzawora)
-            context_lens_tensor=context_lens_tensor, # FIXME(kzawora)
+            seq_lens_tensor=seq_lens_tensor,  # FIXME(kzawora)
+            context_lens_tensor=context_lens_tensor,  # FIXME(kzawora)
             num_prefills=num_prefills,
             num_prefill_tokens=total_num_scheduled_tokens if is_prompt else 0,
             num_decode_tokens=total_num_scheduled_tokens if is_decode else 0,
             slot_mapping=slot_mapping,
-            multi_modal_placeholder_index_maps=None  # FIXME(kzawora): mutli-modality will not work here
+            multi_modal_placeholder_index_maps=
+            None  # FIXME(kzawora): mutli-modality will not work here
         )
         # NOTE(woosuk): Due to chunked prefills, there can be at most 1 partial
         # request in the batch. While we should not sample any token from this
@@ -522,6 +614,9 @@ class HPUModelRunner:
     def _prepare_sampling(
         self,
         scheduler_output: "SchedulerOutput",
+        prefill_only : bool = False,
+        decode_only : bool = False,
+        seq_idx : Optional[int] = None
     ) -> SamplingMetadata:
         skip_copy = True
         if (scheduler_output.finished_req_ids
@@ -531,22 +626,20 @@ class HPUModelRunner:
                 or scheduler_output.scheduled_resumed_reqs):
             skip_copy = False
         # Create the sampling metadata.
-        sampling_metadata = self.input_batch.make_sampling_metadata(skip_copy)
+        sampling_metadata = self.input_batch.make_sampling_metadata(skip_copy=skip_copy, prefill_only=prefill_only, decode_only=decode_only, seq_idx=seq_idx)
         return sampling_metadata
-    
+
     def get_habana_paged_attn_buffers(self, block_tables, slot_mapping):
         block_mapping: Union[List[Union[None, int]], torch.Tensor]
         block_usage: Union[List[Union[None, int]], torch.Tensor]
         block_scales: Union[List[Union[None, float]], torch.Tensor]
         block_list: Union[List[int], torch.Tensor]
 
-        if False: #self.use_contiguous_pa:
+        if True: #self.use_contiguous_pa:
             block_list = list(itertools.chain(*block_tables))
             max_idx = max(block_list)
             max_blocks = max(max_idx + 1, len(block_list))
-            block_bucket_size = find_bucket(
-                max_blocks,
-                self.bucketing_global_state.decode_block_bucket_cfg)
+            block_bucket_size = max_blocks
             block_bucket_size = min(block_bucket_size,
                                     self.cache_config.num_gpu_blocks)
 
@@ -555,7 +648,7 @@ class HPUModelRunner:
             block_scales = [None] * block_bucket_size
 
             for i, bt in enumerate(block_tables):
-                if bt:
+                if bt is not None:
                     blocks_in_group = len(bt)
                     scale = 1.0 / blocks_in_group
                     for b in bt:
@@ -568,7 +661,7 @@ class HPUModelRunner:
             block_scales = [b if b is not None else 0.0 for b in block_scales]
 
             for bt, sl in zip(block_tables, slot_mapping):
-                if bt:
+                if bt is not None:
                     block_usage[bt[-1]] = sl[-1] % self.block_size + 1
             block_usage = [u if u is not None else 1 for u in block_usage]
 
@@ -606,38 +699,40 @@ class HPUModelRunner:
         block_groups = pad_list(block_mapping, block_bucket_size,
                                 len(block_tables))
         block_list_tensor = torch.empty(len(block_list),
-                                dtype=torch.int,
-                                device=self.device)
-        block_list_tensor.copy_(torch.tensor(block_list),
-                                non_blocking=True)
-        
+                                        dtype=torch.int,
+                                        device=self.device)
+        block_list_tensor.copy_(torch.tensor(block_list), non_blocking=True)
+
         block_mapping_tensor = torch.empty(len(block_mapping),
-                                    dtype=torch.long,
-                                    device=self.device)
-        block_mapping_tensor.copy_(torch.tensor(block_mapping), 
-                                   non_blocking=True)
-        
-        block_groups_tensor = torch.empty(len(block_groups),
-                                    dtype=torch.long,
-                                    device=self.device)
-        block_groups_tensor.copy_(torch.tensor(block_groups), 
+                                           dtype=torch.long,
+                                           device=self.device)
+        block_mapping_tensor.copy_(torch.tensor(block_mapping),
                                    non_blocking=True)
 
+        block_groups_tensor = torch.empty(len(block_groups),
+                                          dtype=torch.long,
+                                          device=self.device)
+        block_groups_tensor.copy_(torch.tensor(block_groups),
+                                  non_blocking=True)
+
         block_usage_tensor = torch.empty(len(block_usage),
-                                dtype=self.model_config.dtype,
-                                device=self.device)
-        block_usage_tensor.copy_(torch.tensor(block_usage),  # <- why do I see a device deadlock here??? 
-                                 non_blocking=True)
-        
+                                         dtype=self.model_config.dtype,
+                                         device=self.device)
+        block_usage_tensor.copy_(
+            torch.tensor(
+                block_usage),  # <- why do I see a device deadlock here??? 
+            non_blocking=True)
+
         block_scales_tensor = torch.empty(len(block_scales),
-                                    dtype=self.model_config.dtype,
-                                    device=self.device)
-        block_scales_tensor.copy_(torch.tensor(block_scales), non_blocking=True)
+                                          dtype=self.model_config.dtype,
+                                          device=self.device)
+        block_scales_tensor.copy_(torch.tensor(block_scales),
+                                  non_blocking=True)
 
         return block_list_tensor, block_mapping_tensor, block_groups_tensor, block_usage_tensor, block_scales_tensor
 
     @torch.inference_mode()
-    def execute_model(
+    def execute_model_old(
         self,
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput:
@@ -651,8 +746,8 @@ class HPUModelRunner:
         trimmed_attn_metadata = trim_attn_metadata(attn_metadata)
         with set_forward_context(attn_metadata):
             hidden_states = self.model.forward(
-                input_ids=self.input_ids[:batch_size,:max_blocked_seq_len],
-                positions=self.positions[:batch_size,:max_blocked_seq_len],
+                input_ids=self.input_ids[:batch_size, :max_blocked_seq_len],
+                positions=self.positions[:batch_size, :max_blocked_seq_len],
                 kv_caches=self.kv_caches,
                 attn_metadata=trimmed_attn_metadata,
             )
@@ -684,8 +779,8 @@ class HPUModelRunner:
                 token_id = sampled_token_ids_list[i]
                 self.input_batch.token_ids_cpu[i, seq_len] = token_id
                 req_state.output_token_ids.append(token_id)
-                req_state.num_output_tokens += 1
-                self.input_batch.num_output_tokens_cpu[i] += 1
+                #req_state.num_output_tokens += 1
+                #self.input_batch.num_output_tokens_cpu[i] += 1
             else:
                 # Ignore the sampled token from the partial request.
                 # Rewind the generator state as if the token was not sampled.
@@ -711,53 +806,331 @@ class HPUModelRunner:
         )
         return model_runner_output
 
-    def load_model(self) -> None:
-        if self.use_cuda_graph:
-            # FIXME(woosuk): Currently, we do not use inductor to reduce the
-            # compilation time and any potential issues with the inductor.
-            os.environ["VLLM_CUSTOM_OPS"] = "all"
-            set_compilation_config(
-                CompilationConfig(
-                    use_cudagraph=True,
-                    non_cudagraph_ops=["vllm.unified_v1_flash_attention"],
-                    use_inductor=False,
-                ))
+    def _prepare_prefill_inputs(
+        self,
+        num_scheduled_tokens: List[int],
+    ) -> PrefillInputData:
+        # Each prefill run separately with shape [1, padded_prompt_len].
+        # So we create lists that will be used in execute_model().
 
+        prefill_request_ids = []
+        prefill_prompt_lens = []
+        prefill_token_ids = []
+        prefill_position_ids = []
+        prefill_attn_metadata = []
+        prefill_logits_indices = []
+        
+        # DECODES are the first num_decodes REQUESTS.
+        # PREFILLS are the next num_reqs - num_decodes REQUESTS.
+        num_reqs = self.input_batch.num_reqs
+        num_decodes = self.input_batch.num_decodes
+        for idx in range(num_decodes, num_reqs):
+            prefill_request_ids.append(self.input_batch.req_ids[idx])
+
+            # STATIC SHAPE: prefills are padded to the next power of 2.
+            prompt_len = num_scheduled_tokens[idx]
+            padded_prompt_len = _get_padded_prefill_len(prompt_len)
+            prefill_prompt_lens.append(prompt_len)
+            assert padded_prompt_len <= self.max_model_len
+
+            # TOKEN_IDS.
+            token_ids = torch.from_numpy(self.input_batch.token_ids_cpu[
+                idx, :padded_prompt_len].reshape(1, -1))
+            prefill_token_ids.append(token_ids.to(self.device))
+
+            # POSITIONS.
+            positions = self.prefill_positions[:, :padded_prompt_len]
+            prefill_position_ids.append(positions.to(self.device))
+
+            # SLOT_MAPPING.
+            # The "slot" is the "physical index" of a token in the KV cache.
+            # Look up the block_idx in the block table (logical<>physical map)
+            # to compute this.
+            block_numbers = self.input_batch.block_table_cpu_tensor[
+                idx, positions // self.block_size].reshape(1, -1)
+            block_offsets = positions % self.block_size
+            slot_mapping = block_numbers * self.block_size + block_offsets
+            # Set an out of range value for the padding tokens so that they
+            # are ignored when inserting into the KV cache.
+            slot_mapping[:, prompt_len:] = _PAD_SLOT_ID
+            slot_mapping = slot_mapping.long()
+
+            # ATTN_METADATA.
+            prefill_attn_metadata.append(
+                HPUAttentionMetadata.make_prefill_metadata(
+                    seq_lens_tensor=torch.tensor(padded_prompt_len,
+                                                 device=self.device),
+                    num_prefills=1,
+                    num_prefill_tokens=padded_prompt_len,
+                    slot_mapping=slot_mapping.to(self.device),
+                ))
+            prefill_logits_indices.append(prompt_len)
+
+        return PrefillInputData(
+            request_ids=prefill_request_ids,
+            prompt_lens=prefill_prompt_lens,
+            token_ids=prefill_token_ids,
+            position_ids=prefill_position_ids,
+            attn_metadata=prefill_attn_metadata,
+            logits_indices=prefill_logits_indices
+        )
+
+    def _prepare_decode_inputs(self, num_decodes: int, scheduler_output) -> DecodeInputData:
+        # Decodes run as one single padded batch with shape [batch, 1]
+        #
+        # We need to set _PAD_SLOT_ID for the padding tokens in the
+        # slot_mapping, such that the attention KV cache insertion
+        # logic knows to ignore those indicies. Otherwise, the
+        # padding data can be dummy since we have a causal mask.
+
+        if num_decodes == 0:
+            return DecodeInputData(num_decodes=0)
+
+        # PAD FOR STATIC SHAPES.
+        padded_batch_size = _get_padded_batch_size(num_decodes)
+
+        # POSITIONS. [batch, 1]
+        # We slice at the end, since we use the positions for gathering.
+        positions = torch.from_numpy(
+            self.input_batch.num_computed_tokens_cpu.reshape(-1, 1))
+        index = positions.to(torch.int64)
+        positions = positions[:padded_batch_size]
+
+        # TOKEN_IDS. [batch, 1]
+        token_ids = torch.gather(
+            input=torch.from_numpy(self.input_batch.token_ids_cpu),
+            dim=1,
+            index=index,
+        )[:padded_batch_size]
+
+        # SLOT_MAPPING [batch, 1]
+        # The "slot" is the "physical index" of a token in the KV cache.
+        # Look up the block_idx in the block table (logical<>physical map)
+        # to compute this.
+        block_number = torch.gather(
+            input=self.input_batch.block_table_cpu_tensor,
+            dim=1,
+            index=(index // self.block_size))
+        block_offsets = index % self.block_size
+        slot_mapping = block_number * self.block_size + block_offsets
+        # Set an out of range value for the padding tokens so that they
+        # are ignored when inserting into the KV cache.
+        slot_mapping[num_decodes:] = _PAD_SLOT_ID
+        slot_mapping = slot_mapping[:padded_batch_size]
+
+        # BLOCK_TABLE [batch, max_num_blocks_per_req]
+        block_table = self.input_batch.block_table_cpu_tensor[:padded_batch_size]
+        # CONTEXT_LENS [batch_size]
+        context_lens = (positions.reshape(-1) + 1)
+
+        block_list_tensor, _, block_groups_tensor, block_usage_tensor, _ = self.get_habana_paged_attn_buffers(block_table, slot_mapping)
+        
+        num_scheduled_tokens = []
+        max_num_scheduled_tokens = 0
+        for req_id in self.input_batch.req_ids[:num_decodes]:
+            num_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            num_scheduled_tokens.append(num_tokens)
+            max_num_scheduled_tokens = max(max_num_scheduled_tokens,
+                                           num_tokens)
+        num_scheduled_tokens = np.array(num_scheduled_tokens, dtype=np.int32)
+        query_start_loc = torch.empty((num_decodes + 1, ),
+                                      dtype=torch.int32,
+                                      device="cpu",
+                                      pin_memory=self.pin_memory)
+        query_start_loc_np = query_start_loc.numpy()
+        query_start_loc_np[0] = 0
+        np.cumsum(num_scheduled_tokens, out=query_start_loc_np[1:])
+        logits_indices = query_start_loc[1:] - 1
+        # CPU<>HPU sync happens here.
+        return DecodeInputData(
+            num_decodes=num_decodes,
+            token_ids=token_ids.to(self.device),
+            position_ids=positions.to(self.device),
+            logits_indices=logits_indices.to(self.device),         
+            attn_metadata=HPUAttentionMetadata.make_decode_metadata(
+                block_list=block_list_tensor,
+                block_usage=block_usage_tensor,
+                block_groups=block_groups_tensor,
+                num_decode_tokens=torch.sum(context_lens).item(),
+                slot_mapping=slot_mapping.to(self.device),
+            ))
+
+    def _prepare_inputs(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> Tuple[PrefillInputData, Optional[DecodeInputData]]:
+
+        total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        assert total_num_scheduled_tokens > 0
+
+        num_reqs = self.input_batch.num_reqs
+        num_decodes = self.input_batch.num_decodes
+
+        # Get the number of scheduled tokens for each request.
+        # TODO: The Python loop can be slow. Optimize.
+        num_scheduled_tokens = []
+        for idx, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            num_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            num_scheduled_tokens.append(num_tokens)
+
+            # NOTE: assert that all the decodes are "decodes".
+            if idx < num_decodes:
+                assert num_tokens == 1
+
+        return (
+            self._prepare_prefill_inputs(num_scheduled_tokens),
+            self._prepare_decode_inputs(num_decodes, scheduler_output),
+        )
+    
+    def _execute_model_generic(self, token_ids, position_ids, attn_metadata, logits_indices):
+        # FORWARD.
+        trimmed_attn_metadata = trim_attn_metadata(attn_metadata)
+        hidden_states = self.model.forward(input_ids=token_ids,
+                                                positions=position_ids,
+                                                attn_metadata=trimmed_attn_metadata,
+                                                kv_caches=self.kv_caches)
+
+        #hidden_states = hidden_states[:num_scheduled_tokens]
+        hidden_states = hidden_states[logits_indices]
+        logits = self.model.compute_logits(hidden_states, None)
+        return logits
+
+
+    def _execute_model_prefills(self, scheduler_output, prefill_data, prefill_start_idx, sampled_token_ids, logprobs, logprob_token_ids):
+        if len(list(prefill_data.zipped())) == 0:
+            logger.info(f"[ENGINE_ITER {self._ENGINE_ITER}] No prefills detected.")
+            return None, None
+
+        for idx, (req_id, prompt_len, token_ids, position_ids,
+                  attn_metadata, logits_indices) in enumerate(prefill_data.zipped()):
+            logits = self._execute_model_generic(token_ids, position_ids, attn_metadata, logits_indices)
+
+            # Sample the next token and get logprobs if needed.
+            sampling_metadata = self._prepare_sampling(scheduler_output, seq_idx=idx)
+            sampler_output = self.model.sample(
+                logits=logits,
+                sampling_metadata=sampling_metadata,
+            )
+
+            # NOTE: HPU<>CPU sync happens here.
+            token_id = sampler_output.sampled_token_ids.cpu().item()
+            sampled_token_ids[prefill_start_idx + idx] = token_id
+            req_state = self.requests[req_id]
+
+            if sampler_output.logprob_token_ids is not None:
+                logprob_token_ids[prefill_start_idx + idx] = sampler_output.logprob_token_ids.cpu()
+            if sampler_output.logprobs is not None:
+                logprobs[prefill_start_idx + idx] = sampler_output.logprobs.cpu()
+
+            # TODO: ASSERT NO PREFIX CACHING.
+            assert req_state.num_computed_tokens == 0
+            seq_len = (req_state.num_computed_tokens +
+                       scheduler_output.num_scheduled_tokens[req_id])
+
+            # TODO: ASSERT NO CHUNKED PREFILL.
+            assert seq_len == req_state.num_tokens
+            assert prompt_len == seq_len
+
+            # UPDATE REQUEST STATE.
+            req_idx = self.input_batch.req_id_to_index[req_id]
+            self.input_batch.token_ids_cpu[req_idx, seq_len] = token_id
+            req_state.output_token_ids.append(token_id)
+        return sampled_token_ids, logprobs, logprob_token_ids
+
+    def _execute_model_decode(self, scheduler_output, decode_data, sampled_token_ids, logprobs, logprob_token_ids):
+        pass
+
+    @torch.no_grad()
+    def execute_model(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> ModelRunnerOutput:
+        self._update_states(scheduler_output)
+        logger.info(f'[ENGINE_ITER {self._ENGINE_ITER}] Starting engine iteration with {self.input_batch.num_reqs} reqs...')
+        prefill_data, decode_data = self._prepare_inputs(scheduler_output)
+        num_reqs = self.input_batch.num_reqs
+        sampled_token_ids = torch.empty(num_reqs, dtype=torch.int32)
+        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        logprob_token_ids = None
+        logprobs = None
+        ######################### DECODES #########################
+        # Decodes run as one single batch with [padded_batch, 1]
+        if decode_data.num_decodes > 0:
+            #sampled_token_ids, logprob_token_ids, logprobs = self._execute_model_decode(scheduler_output, decode_data, sampled_token_ids, None, None)
+            logger.info(f"[ENGINE_ITER {self._ENGINE_ITER}] Executing decode on {decode_data.num_decodes} seqs...")
+            logits = self._execute_model_generic(decode_data.token_ids, decode_data.position_ids, decode_data.attn_metadata, decode_data.logits_indices)
+            
+            # Sample the next token and get logprobs if needed.
+            sampling_metadata = self._prepare_sampling(scheduler_output, decode_only=True)
+            sampler_output = self.model.sample(
+                logits=logits,
+                sampling_metadata=sampling_metadata,
+            )
+
+            # NOTE: TPU<>CPU sync happens here.
+            # We need to call .cpu() first to avoid recompilation.
+            token_ids = sampler_output.sampled_token_ids.cpu()[:decode_data.num_decodes]
+            sampled_token_ids_list = token_ids.tolist()
+            sampled_token_ids[:decode_data.num_decodes] = token_ids
+
+            # UPDATE REQUEST STATE.
+            for i, req_id in enumerate(
+                    self.input_batch.req_ids[:decode_data.num_decodes]):
+                req_state = self.requests[req_id]
+
+                # TODO: ASSERT NO CHUNKED PREFILL.
+                assert scheduler_output.num_scheduled_tokens[req_id] == 1
+                seq_len = (req_state.num_computed_tokens +
+                           scheduler_output.num_scheduled_tokens[req_id])
+                assert seq_len == req_state.num_tokens
+
+                token_id = sampled_token_ids_list[i]
+                self.input_batch.token_ids_cpu[i, seq_len] = token_id
+                req_state.output_token_ids.append(token_id)
+
+        ######################### PREFILLS #########################
+        # Prefills run separately with shape [1, padded_prefill_len],
+        # due to lack of variable length attention kernel so far.
+        if num_reqs - decode_data.num_decodes > 0:
+            logger.info(f"[ENGINE_ITER {self._ENGINE_ITER}] Executing prefill on {num_reqs - decode_data.num_decodes} seqs...")
+            sampled_token_ids, logprob_token_ids, logprobs = self._execute_model_prefills(scheduler_output, prefill_data,decode_data.num_decodes, sampled_token_ids, None, None)
+        
+        model_runner_output = ModelRunnerOutput(
+            req_ids=self.input_batch.req_ids[:num_reqs],
+            req_id_to_index=self.input_batch.req_id_to_index,
+            sampled_token_ids_cpu=sampled_token_ids,
+            logprob_token_ids_cpu=logprob_token_ids,
+            logprobs_cpu=logprobs,
+        )
+        logger.info(f'[ENGINE_ITER {self._ENGINE_ITER}] Engine iteration done!')
+        self._ENGINE_ITER += 1
+        return model_runner_output
+
+    def load_model(self) -> None:
         logger.info("Starting to load model %s...", self.model_config.model)
         with HabanaMemoryProfiler() as m:  # noqa: SIM117
             self.model = get_model(vllm_config=self.vllm_config)
-            self.model = _maybe_wrap_in_hpu_graph(self.model, self.block_size, 
-                                                  dtype=self.model_config.dtype, 
-                                                  enforce_eager=self.model_config.enforce_eager)
+            self.model = _maybe_wrap_in_hpu_graph(
+                self.model,
+                self.block_size,
+                dtype=self.model_config.dtype,
+                enforce_eager=self.model_config.enforce_eager)
         self.model_memory_usage = m.consumed_device_memory
         logger.info("Loading model weights took %.4f GB",
                     self.model_memory_usage / float(2**30))
 
-
-    def _dummy_run(
-        self,
-        batch_size: int, 
-        seq_len: int,
-        kv_caches: List[torch.Tensor],
-        is_prompt: bool
-    ) -> None:
+    def _dummy_run(self, batch_size: int, seq_len: int,
+                   kv_caches: List[torch.Tensor], is_prompt: bool) -> None:
         """Dummy warmup run for memory usage and graph compilation."""
 
-        input_ids = torch.zeros(
-            (batch_size, seq_len),
-            dtype=torch.int32,
-            device=self.device
-        )
-        position_ids = torch.zeros(
-            (batch_size, seq_len),
-            dtype=torch.int32,
-            device=self.device
-        )
-        slot_mapping = torch.zeros(
-            (batch_size, seq_len),
-            dtype=torch.int64,
-            device=self.device
-        )
+        input_ids = torch.zeros((batch_size, seq_len),
+                                dtype=torch.int32,
+                                device=self.device)
+        position_ids = torch.zeros((batch_size, seq_len),
+                                   dtype=torch.int32,
+                                   device=self.device)
+        slot_mapping = torch.zeros((batch_size, seq_len),
+                                   dtype=torch.int64,
+                                   device=self.device)
         block_tables = None if is_prompt else torch.zeros(
             (batch_size, self.max_num_blocks_per_req),
             dtype=torch.int32,
@@ -768,7 +1141,8 @@ class HPUModelRunner:
             dtype=torch.int32,
             device=self.device,
         )
-        block_indices, block_offsets = precompute_indices_and_offsets(self.block_size, slot_mapping, True)
+        block_indices, block_offsets = precompute_indices_and_offsets(
+            self.block_size, slot_mapping, True)
         # TODO(kzawora): form proper hpu attn metadata
         prefix_block_list_tensor = None
         attn_metadata = HPUAttentionMetadata(
@@ -787,18 +1161,20 @@ class HPUModelRunner:
             num_prefill_tokens=batch_size * seq_len if is_prompt else 0,
             num_decode_tokens=0 if is_prompt else batch_size,
             slot_mapping=slot_mapping,
-            multi_modal_placeholder_index_maps=None  # FIXME(kzawora): mutli-modality will not work here
+            multi_modal_placeholder_index_maps=
+            None  # FIXME(kzawora): mutli-modality will not work here
         )
-        selected_token_indices = torch.arange(0, seq_len*batch_size, device=self.device)
+        selected_token_indices = torch.arange(0,
+                                              seq_len * batch_size,
+                                              device=self.device)
         trimmed_attn_metadata = trim_attn_metadata(attn_metadata)
-        return # bypass dummy run for now
+        return  # bypass dummy run for now
         # Dummy run.
         self.model.forward(input_ids=input_ids,
-                            positions=position_ids,
-                            kv_caches=kv_caches,
-                            attn_metadata=trimmed_attn_metadata,
-                            selected_token_indices=selected_token_indices)
-
+                           positions=position_ids,
+                           kv_caches=kv_caches,
+                           attn_metadata=trimmed_attn_metadata,
+                           selected_token_indices=selected_token_indices)
 
     @torch.inference_mode()
     def profile_run(self) -> None:
@@ -818,22 +1194,14 @@ class HPUModelRunner:
         seq_len = (self.max_num_tokens + 15) // 16 * 16
 
         # Run empty forward.
-        self._dummy_run(
-            batch_size=1,
-            seq_len=seq_len,
-            kv_caches=kv_caches,
-            is_prompt=True)
+        self._dummy_run(batch_size=1,
+                        seq_len=seq_len,
+                        kv_caches=kv_caches,
+                        is_prompt=True)
         torch.hpu.synchronize()
 
     @torch.inference_mode()
     def capture_model(self) -> None:
-        if not self.use_cuda_graph:
-            logger.warning(
-                "Skipping CUDA graph capture. Please set "
-                "VLLM_TORCH_COMPILE_LEVEL=%d to use CUDA graphs.",
-                CompilationLevel.PIECEWISE)
-            return
-
         start_time = time.perf_counter()
         start_free_gpu_memory = torch.cuda.mem_get_info()[0]
 
@@ -867,7 +1235,9 @@ class HPUModelRunner:
           and self.dtype == torch.float8_e4m3fn:
             dtype = torch.uint8
         for _ in range(self.num_attn_layers):
-            key_cache = torch.zeros(kv_cache_shape, dtype=dtype, device=self.device)
+            key_cache = torch.zeros(kv_cache_shape,
+                                    dtype=dtype,
+                                    device=self.device)
             value_cache = torch.zeros(kv_cache_shape,
                                       dtype=dtype,
                                       device=self.device)
@@ -889,13 +1259,13 @@ class CachedRequestState:
     req_id: str
     prompt_token_ids: List[int]
     prompt: Optional[str]
-    multi_modal_data: Optional["MultiModalDataDict"]
+    mm_inputs: List[MultiModalKwargs]
+    mm_positions: List["PlaceholderRange"]
     sampling_params: SamplingParams
     generator: Optional[torch.Generator]
 
     block_ids: List[int]
     num_computed_tokens: int
-    num_output_tokens: int
     output_token_ids: List[int]
 
     @property
@@ -978,6 +1348,8 @@ class InputBatch:
         self.num_logprobs: Dict[str, int] = {}
         self.prompt_logprob_reqs: Set[str] = set()
 
+        self.num_prefills = 0
+
     def add_request(
         self,
         request: "CachedRequestState",
@@ -1001,7 +1373,7 @@ class InputBatch:
                            start_idx:end_idx] = request.output_token_ids
 
         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
-        self.num_output_tokens_cpu[req_index] = request.num_output_tokens
+        #self.num_output_tokens_cpu[req_index] = request.num_output_tokens
         self.num_prompt_tokens_cpu[req_index] = len(request.prompt_token_ids)
         num_blocks = len(request.block_ids)
         self.block_table_cpu[req_index, :num_blocks] = request.block_ids
@@ -1100,20 +1472,36 @@ class InputBatch:
     def make_sampling_metadata(
         self,
         skip_copy: bool = False,
+        prefill_only : bool = False,
+        decode_only : bool = False,
+        seq_idx : Optional[int] = None 
     ) -> SamplingMetadata:
+        start_seq = 0
+        end_seq = self.num_reqs
+        if prefill_only:
+            start_seq = self.num_decodes
+            assert not (decode_only or seq_idx), "make_sampling_metadata can be either prefill_only, decode_only, seq_idx, or neither."
+        elif decode_only:
+            end_seq = self.num_decodes
+            assert not (prefill_only or seq_idx), "make_sampling_metadata can be either prefill_only, decode_only, seq_idx, or neither."
+        elif seq_idx is not None:
+            start_seq = seq_idx
+            end_seq = seq_idx + 1
+            assert not (prefill_only or decode_only), "make_sampling_metadata can be either prefill_only, decode_only, seq_idx, or neither."
+
         if not skip_copy:
-            self.temperature[:self.num_reqs].copy_(
-                self.temperature_cpu_tensor[:self.num_reqs], non_blocking=True)
-            self.top_p[:self.num_reqs].copy_(
-                self.top_p_cpu_tensor[:self.num_reqs], non_blocking=True)
-            self.top_k[:self.num_reqs].copy_(
-                self.top_k_cpu_tensor[:self.num_reqs], non_blocking=True)
+            self.temperature[start_seq:end_seq].copy_(
+                self.temperature_cpu_tensor[start_seq:end_seq], non_blocking=True)
+            self.top_p[start_seq:end_seq].copy_(
+                self.top_p_cpu_tensor[start_seq:end_seq], non_blocking=True)
+            self.top_k[start_seq:end_seq].copy_(
+                self.top_k_cpu_tensor[start_seq:end_seq], non_blocking=True)
         return SamplingMetadata(
-            temperature=self.temperature[:self.num_reqs],
+            temperature=self.temperature[start_seq:end_seq],
             all_greedy=self.all_greedy,
             all_random=self.all_random,
-            top_p=self.top_p[:self.num_reqs],
-            top_k=self.top_k[:self.num_reqs],
+            top_p=self.top_p[start_seq:end_seq],
+            top_k=self.top_k[start_seq:end_seq],
             no_top_p=self.no_top_p,
             no_top_k=self.no_top_k,
             generators=self.generators,
@@ -1125,6 +1513,10 @@ class InputBatch:
         return len(self.req_id_to_index)
 
     @property
+    def num_decodes(self) -> int:
+        return self.num_reqs - self.num_prefills
+
+    @property
     def all_greedy(self) -> bool:
         return len(self.random_reqs) == 0
 
@@ -1132,13 +1524,16 @@ class InputBatch:
     def all_random(self) -> bool:
         return len(self.greedy_reqs) == 0
 
-    @property
-    def all_prefill(self) -> bool:
-        return all(output_tokens == 0 for output_tokens in self.num_output_tokens_cpu[:self.num_reqs])
+        #    @property
+        #    def all_prefill(self) -> bool:
+        return all(
+            output_tokens == 0
+            for output_tokens in self.num_output_tokens_cpu[:self.num_reqs])
 
-    @property
-    def all_decode(self) -> bool:
-        return all(output_tokens > 0 for output_tokens in self.num_output_tokens_cpu[:self.num_reqs])
+
+#    @property
+#    def all_decode(self) -> bool:
+#        return all(output_tokens > 0 for output_tokens in self.num_output_tokens_cpu[:self.num_reqs])
 
     @property
     def mixed_batch(self) -> bool:
