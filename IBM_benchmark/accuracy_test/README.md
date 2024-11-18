@@ -5,7 +5,7 @@
 ### Clone repositories
 ```
 git clone https://github.com/HabanaAI/vllm-fork.git
-git clone ssh://gerrit.habana-labs.com:29418/vllm-benchmarks
+git clone https://github.com/habana-internal/vllm-benchmarks.git
 ```
 
 ### Checkout vllm-fork branch
@@ -34,15 +34,42 @@ docker run -it --rm  \
 ```
 
 ### Installation
-
-
 Setup Accuracy tests: you may need to edit `/software` paths in `setup.sh` if it isn't mounted properly as mentioned in previous step
 ```
 cd /git/vllm-benchmarks/benchmarks/acc-mlperf-moe
 bash setup.sh
 pip install -r /git/vllm-benchmarks/models/mixtral-8x7b/requirements.txt
 pip install /git/vllm-fork
+source ~/.bashrc
 ```
+
+#### Verify Installation
+
+Command 1:
+```
+env | grep NVM
+```
+Expected Output:
+```text
+NVM_INC=/root/.nvm/versions/node/v16.10.0/include/node
+NVM_DIR=/root/.nvm
+NVM_CD_FLAGS=
+NVM_BIN=/root/.nvm/versions/node/v16.10.0/bin
+```
+
+Command 2:
+```
+npm list -g --depth=0
+```
+Expected Output:
+```text
+/root/.nvm/versions/node/v16.10.0/lib
++-- corepack@0.9.0
++-- lodash@4.17.21
++-- npm@7.24.0
+`-- typescript@5.6.3
+```
+
 
 ## Run Accuracy
 
