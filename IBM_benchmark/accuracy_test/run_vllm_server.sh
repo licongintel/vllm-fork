@@ -229,7 +229,7 @@ export VLLM_DECODE_BLOCK_BUCKET_STEP=$steps
 export VLLM_DECODE_BLOCK_BUCKET_MAX=$block_bucket_max
 
 export VLLM_PROMPT_USE_FUSEDSDPA=true
-export VLLM_PA_SOFTMAX_IMPL=const
+#export VLLM_PA_SOFTMAX_IMPL=const
 export VLLM_CONTIGUOUS_PA=true
 
 max_model_len=$(($input_len + $output_len))
